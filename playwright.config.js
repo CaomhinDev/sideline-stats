@@ -1,6 +1,6 @@
 import { defineConfig, devices } from "@playwright/test";
 
-// Set BASE_URL to test a deployed copy, e.g. BASE_URL=https://<your-site>/
+// Set BASE_URL to test a deployed copy, e.g. BASE_URL=https://caomhindev.github.io/sideline-stats/
 const remote = process.env.BASE_URL;
 
 export default defineConfig({

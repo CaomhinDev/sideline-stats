@@ -5,7 +5,8 @@
   "scripts": {
     "serve": "python3 -m http.server 8091 --bind 0.0.0.0",
     "test": "node --test tests/*.test.js",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "deploy": "git push origin main"
   },
   "devDependencies": {
     "@playwright/test": "^1.56.1"

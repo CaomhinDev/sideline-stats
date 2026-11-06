@@ -26,4 +26,16 @@ npm run serve        # http://localhost:8091, also reachable from your LAN
 ```sh
 npm test             # data logic (Node's built-in test runner)
 npm run test:e2e     # browser tests in headless Chromium (Playwright)
+BASE_URL=https://caomhindev.github.io/sideline-stats/ npm run test:e2e   # against the live site
+```
+
+## Deploy
+
+Live at https://caomhindev.github.io/sideline-stats/ (GitHub Pages). Every push
+to `main` runs all tests and publishes only if they pass
+(`.github/workflows/deploy.yml`). Only `index.html`, `styles.css`, `icon.svg`
+and `js/` are published.
+
+```sh
+npm run deploy       # same as: git push origin main
 ```
