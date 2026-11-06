@@ -10,13 +10,13 @@ for (const scheme of ["light", "dark"]) {
       const names = ["Sam", "Alex", "Chris", "Pat", "Jamie", "Rory", "Jordan", "Lee", "Dan", "Finn", "Cian", "Oisin", "Liam", "Conor"];
       const nums = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16];
       const players = names.map((name, i) => ({ id: i + 1, number: nums[i], name }));
-      const types = ["tackle_won", "broken_won", "broken_lost", "air_won", "air_lost", "save", "shot_on", "shot_off", "goal"];
+      const types = ["tackle_won", "broken_won", "broken_lost", "air_won", "air_lost", "save", "shot_on", "shot_off", "goal", "yellow"];
       let seed = 7;
       const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
       const events = [];
       let id = 100;
       for (let i = 0; i < 46; i++) {
-        const type = types[Math.floor(rnd() * 9)];
+        const type = types[Math.floor(rnd() * 10)];
         const shot = type.startsWith("shot") || type === "goal";
         const half = i < 26 ? 1 : 2;
         events.push({
@@ -30,7 +30,7 @@ for (const scheme of ["light", "dark"]) {
         { id: 50, opponent: "Rovers U12", date: "2026-11-07", halfLength: 30, squad: players.map((p) => p.id),
           starting: players.slice(0, 11).map((p) => p.id),
           subs: [{ id: 900, half: 1, t: 1200, on: [12], off: [3] }, { id: 901, half: 2, t: 1800, on: [13, 14], off: [7, 9] }],
-          conceded: [{ id: 902, half: 1, t: 1500 }],
+          conceded: [{ id: 902, half: 1, t: 1500 }], // old format: converted on load
           periods: [{ start: now - 52 * 60_000, end: now - 21 * 60_000 }, { start: now - 1 * 60_000 - 23_000, end: null }], events },
         { id: 51, opponent: "City", date: "2026-10-31", halfLength: 30, squad: players.map((p) => p.id),
           periods: [{ start: 1, end: 1800001 }, { start: 2000000, end: 3800000 }], events: events.slice(0, 20).map((e) => ({ ...e, id: e.id + 1000 })) },

@@ -271,40 +271,80 @@ test("dropping an on-pitch player from the team sheet subs them off", () => {
   assert.equal(S.playingTime(g, 20 * MIN).get(b.id), 300);
 });
 
-test("score: our goals from Goal events, theirs from conceded", () => {
+test("score: Goal events for us and for the opposition", () => {
   const st = S.emptyState();
   const a = S.addPlayer(st, "9", "A").player;
   const g = S.createGame(st, { opponent: "R", halfLength: 30 }).game;
   S.advancePhase(g, 0);
   S.addEvent(st, g, { type: "goal", playerId: a.id, x: 1, y: 0.5 }, MIN);
   S.addEvent(st, g, { type: "goal", playerId: null, x: 1, y: 0.5 }, 2 * MIN);
-  const c = S.concede(st, g, 3 * MIN);
+  const c = S.addEvent(st, g, { type: "goal", team: "them", playerId: a.id, x: 0.02, y: 0.5 }, 3 * MIN);
+  assert.equal(c.playerId, null); // opposition events never name our players
+  assert.equal(S.eventPlayerLabel(st, c), "Opposition");
   assert.deepEqual(S.score(g), { us: 2, them: 1 });
-  assert.equal(S.minuteLabel(c, 30), "4'");
-  S.deleteConceded(g, c.id);
+  S.deleteEvent(g, c.id);
   assert.deepEqual(S.score(g), { us: 2, them: 0 });
+  assert.throws(() => S.addEvent(st, g, { type: "goal", team: "ref", x: 0, y: 0 }), /Unknown team/);
 });
 
-test("broken ball events exist with stable ids", () => {
-  assert.equal(S.eventType("broken_won").label, "Broken ball won");
-  assert.equal(S.eventType("broken_lost").positive, false);
-  assert.equal(S.EVENT_TYPES.length, 9);
+test("opposition events are tallied apart from ours", () => {
+  const st = S.emptyState();
+  const a = S.addPlayer(st, "4", "A").player;
+  const g = S.createGame(st, { opponent: "R", halfLength: 30 }).game;
+  S.addEvent(st, g, { type: "yellow", playerId: a.id, x: 0.4, y: 0.4 });
+  S.addEvent(st, g, { type: "yellow", team: "them", x: 0.6, y: 0.4 });
+  S.addEvent(st, g, { type: "shot_on", team: "them", x: 0.1, y: 0.5 });
+  const t = S.tally(g.events);
+  assert.equal(t.total.yellow, 1);
+  assert.equal(t.them.yellow, 1);
+  assert.equal(t.them.shot_on, 1);
+  assert.equal(t.total.shot_on, 0);
+  assert.equal(t.byPlayer.has("unknown"), false);
+  assert.equal(S.seasonTally(st).total.yellow, 1);
 });
 
-test("version 2 data gains empty lineups, subs and conceded; v3 round-trips", () => {
+test("events are grouped good then bad for the team, with stable ids", () => {
+  const good = S.EVENT_TYPES.filter((t) => t.positive).map((t) => t.id);
+  const bad = S.EVENT_TYPES.filter((t) => !t.positive).map((t) => t.id);
+  assert.deepEqual(good, ["tackle_won", "broken_won", "air_won", "save", "shot_on", "goal"]);
+  assert.deepEqual(bad, ["broken_lost", "air_lost", "shot_off", "yellow"]);
+  assert.equal(S.eventType("yellow").label, "Yellow card");
+});
+
+test("version 3 goals conceded become opposition Goal events", () => {
+  const v3 = {
+    format: "sideline-stats", version: 3, nextId: 50,
+    players: [{ id: 1, number: 9, name: "A" }],
+    games: [{
+      id: 2, opponent: "R", date: "2026-11-01", halfLength: 30, roster: [{ playerId: 1, number: 9 }], starting: [1], subs: [],
+      conceded: [{ id: 3, half: 1, t: 600 }], periods: [{ start: 0, end: null }],
+      events: [{ id: 4, type: "goal", playerId: 1, number: 9, x: 1, y: 0.5, half: 1, t: 300 }],
+    }],
+  };
+  const g = S.parseState(JSON.stringify(v3)).games[0];
+  assert.equal("conceded" in g, false);
+  assert.deepEqual(S.score(g), { us: 1, them: 1 });
+  const conceded = g.events.find((e) => e.team === "them");
+  assert.deepEqual(conceded, { id: 3, type: "goal", team: "them", playerId: null, number: null, x: null, y: null, half: 1, t: 600 });
+  assert.equal(g.events.find((e) => e.id === 4).team, "us");
+  // And it survives a round trip.
+  assert.deepEqual(S.parseState(JSON.stringify(S.toExport({ nextId: 50, players: [{ id: 1, number: 9, name: "A" }], games: [g] }))).games[0], g);
+});
+
+test("version 2 data gains empty lineups and subs; current data round-trips", () => {
   const st = S.emptyState();
   const [a, b] = ["A", "B"].map((n, i) => S.addPlayer(st, String(i + 1), n).player);
   const g = S.createGame(st, { opponent: "R", halfLength: 30 }).game;
   const v2 = JSON.parse(JSON.stringify(S.toExport(st)));
   v2.version = 2;
-  for (const game of v2.games) { delete game.starting; delete game.subs; delete game.conceded; }
+  for (const game of v2.games) { delete game.starting; delete game.subs; }
   const up = S.parseState(JSON.stringify(v2)).games[0];
-  assert.deepEqual([up.starting, up.subs, up.conceded], [[], [], []]);
+  assert.deepEqual([up.starting, up.subs], [[], []]);
 
   S.setOnPitch(st, g, [a.id], 0);
   S.advancePhase(g, 0);
   S.setOnPitch(st, g, [b.id], MIN);
-  S.concede(st, g, 2 * MIN);
+  S.addEvent(st, g, { type: "goal", team: "them", x: 0, y: 0.5 }, 2 * MIN);
   const back = S.parseState(JSON.stringify(S.toExport(st)));
   assert.deepEqual(back.games[0], g);
   const bad = JSON.parse(JSON.stringify(S.toExport(st)));

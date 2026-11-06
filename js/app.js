@@ -62,6 +62,10 @@ function setProps(el, props = {}) {
 /** Event symbol: colour = group (defending/aerial/attacking), shape = type, hollow = lost / off target. */
 function symbolShape(type, cx, cy, r, extra = {}) {
   const t = S.eventType(type);
+  if (t.shape === "card") {
+    // A yellow card always looks like one: a filled yellow portrait rectangle.
+    return s("rect", { ...extra, class: `sym-card ${extra.class ?? ""}`.trim(), x: cx - r * 0.62, y: cy - r * 0.95, width: r * 1.24, height: r * 1.8, rx: r * 0.15 });
+  }
   const cls = `sym-${t.group}${t.positive ? "" : " sym-hollow"} ${extra.class ?? ""}`.trim();
   const poly = (pts) => s("polygon", { ...extra, class: cls, points: pts.map(([x, y]) => `${cx + x * r},${cy + y * r}`).join(" "), "stroke-linejoin": "round" });
   switch (t.shape) {
@@ -368,11 +372,12 @@ function viewLive(game) {
         : h("a", { class: "btn btn-quiet phase-btn", href: `#/game/${game.id}/stats` }, "Stats")),
     h("div", { class: "live-status", id: "live-status", role: "status", "aria-live": "polite" }, liveStatusContent()),
     h("div", { class: "pitch-wrap" }, pitch),
-    h("div", { class: "events", role: "group", "aria-label": "Event" },
-      S.EVENT_TYPES.map((t) => h("button", {
+    [true, false].map((positive) => h("div", {
+      class: `events ${positive ? "good" : "bad"}`, role: "group", "aria-label": positive ? "Good for the team" : "Bad for the team",
+    }, S.EVENT_TYPES.filter((t) => t.positive === positive).map((t) => h("button", {
         type: "button", class: "ev-btn", "aria-pressed": String(pend.type === t.id), "data-event": t.id,
         onclick: () => { pend.type = pend.type === t.id ? undefined : t.id; afterPick(game); },
-      }, symbolIcon(t.id, 18), h("span", {}, t.label)))),
+      }, symbolIcon(t.id, 18), h("span", {}, t.label))))),
     h("div", { class: "players", role: "group", "aria-label": "Player" },
       players.map((p) => h("button", {
         type: "button", class: `pl-btn${benchDim && !on.has(p.id) ? " bench" : ""}`, "aria-pressed": String(pend.playerId === p.id), "data-number": p.number,
@@ -382,16 +387,16 @@ function viewLive(game) {
       h("button", {
         type: "button", class: "pl-btn", "aria-pressed": String(pend.playerId === null), "data-number": "unknown", "aria-label": "Unknown player",
         onclick: () => { pend.playerId = pend.playerId === null ? undefined : null; afterPick(game); },
-      }, h("span", { class: "n" }, "?"), h("span", { class: "nm" }, "Unknown"))),
+      }, h("span", { class: "n" }, "?"), h("span", { class: "nm" }, "Unknown")),
+      h("button", {
+        type: "button", class: "pl-btn them", "aria-pressed": String(pend.playerId === "them"), "data-number": "them", "aria-label": `Opposition (${game.opponent})`,
+        onclick: () => { pend.playerId = pend.playerId === "them" ? undefined : "them"; afterPick(game); },
+      }, h("span", { class: "n" }, "Them"), h("span", { class: "nm" }, "Opposition"))),
     h("div", { class: "tools" },
       h("button", { type: "button", class: "btn btn-quiet btn-small", disabled: !(pend.x != null || pend.type || pend.playerId !== undefined),
         onclick: () => { app.pending = { gameId: game.id }; render(); } }, "Clear"),
       h("button", { type: "button", class: "btn btn-quiet btn-small", id: "subs-btn", disabled: c.phase === "full" || !game.roster.length, onclick: () => subsDialog(game) }, "Subs"),
-      h("button", { type: "button", class: "btn btn-quiet btn-small", onclick: () => editMatchday(game) }, "Players"),
-      h("button", { type: "button", class: "btn btn-quiet btn-small", id: "they-scored", onclick: () => {
-        const goal = commit(() => S.concede(app.state, game));
-        toast(`${S.minuteLabel(goal, game.halfLength)} Goal conceded`, () => commit(() => S.deleteConceded(game, goal.id)));
-      } }, "They scored")),
+      h("button", { type: "button", class: "btn btn-quiet btn-small", onclick: () => editMatchday(game) }, "Players")),
     h("div", { class: "recent" },
       h("div", { class: "step" }, h("h2", {}, "Latest"), h("a", { class: "link-btn small", href: `#/game/${game.id}/stats`, id: "to-stats" }, `All ${game.events.length} · stats →`)),
       recent.length
@@ -402,11 +407,12 @@ function viewLive(game) {
 function afterPick(game) {
   const p = app.pending;
   if (p.x != null && p.type && p.playerId !== undefined) {
-    const ev = commit((st) => S.addEvent(st, game, { type: p.type, playerId: p.playerId, x: p.x, y: p.y }), { rerender: false });
+    const team = p.playerId === "them" ? "them" : "us";
+    const ev = commit((st) => S.addEvent(st, game, { type: p.type, team, playerId: team === "them" ? null : p.playerId, x: p.x, y: p.y }), { rerender: false });
     app.pending = { gameId: game.id };
     navigator.vibrate?.(30);
     render();
-    toast(`${ev.type === "goal" ? "GOAL! " : ""}${S.minuteLabel(ev, game.halfLength)} ${S.eventPlayerLabel(app.state, ev)} · ${S.eventType(ev.type).label}`,
+    toast(`${ev.type === "goal" ? (team === "them" ? "Conceded: " : "GOAL! ") : ""}${S.minuteLabel(ev, game.halfLength)} ${S.eventPlayerLabel(app.state, ev)} · ${S.eventType(ev.type).label}`,
       () => commit(() => S.deleteEvent(game, ev.id)));
   } else {
     render();
@@ -418,7 +424,7 @@ function eventRow(game, e) {
     h("span", { class: "muted small", style: "width:52px;flex:none;font-variant-numeric:tabular-nums" }, S.minuteLabel(e, game.halfLength)),
     symbolIcon(e.type, 18),
     h("div", { class: "main" },
-      h("div", { class: "primary" }, S.eventType(e.type).label),
+      h("div", { class: "primary" }, S.eventType(e.type).label, e.team === "them" && h("span", { class: "badge them-badge" }, "Them")),
       h("div", { class: "secondary" }, S.eventPlayerLabel(app.state, e))),
     h("button", {
       type: "button", class: "link-btn", "aria-label": `Delete ${S.eventType(e.type).label} at ${S.minuteLabel(e, game.halfLength)}`,
@@ -619,10 +625,13 @@ function pitchSvg({ marks, pending, onTap, label, highlight }) {
 
 function viewStats(game) {
   const f = app.statsFilter;
-  if (f.gameId !== game.id) Object.assign(f, { gameId: game.id, half: 0, types: new Set(S.EVENT_IDS), playerId: undefined });
+  if (f.gameId !== game.id) Object.assign(f, { gameId: game.id, half: 0, types: new Set(S.EVENT_IDS), playerId: undefined, team: "us" });
   const inHalf = game.events.filter((e) => !f.half || e.half === f.half);
   const t = S.tally(inHalf);
-  const shown = inHalf.filter((e) => f.types.has(e.type) && (f.playerId === undefined || (e.playerId ?? "unknown") === f.playerId));
+  const teamOf = (e) => e.team ?? "us";
+  const shown = inHalf.filter((e) => e.x != null && f.types.has(e.type)
+    && (f.team === "all" || teamOf(e) === f.team)
+    && (f.playerId === undefined || (teamOf(e) === "us" && (e.playerId ?? "unknown") === f.playerId)));
   const c = S.clock(game);
 
   return h("section", {},
@@ -634,10 +643,14 @@ function viewStats(game) {
     h("div", { class: "chips", role: "group", "aria-label": "Half" },
       [["Both halves", 0], ["1st half", 1], ["2nd half", 2]].map(([label, v]) =>
         h("button", { type: "button", class: "chip", "aria-pressed": String(f.half === v), onclick: () => { f.half = v; render(); } }, label))),
-    h("div", { class: "totals" }, S.EVENT_TYPES.map((et) => h("div", {},
+    h("h2", {}, "Team totals"),
+    h("div", { class: "totals" }, S.EVENT_TYPES.map((et) => h("div", { class: et.positive ? "good" : "bad" },
       h("div", { class: "v", "data-total": et.id }, t.total[et.id]),
       h("div", { class: "k" }, symbolIcon(et.id, 12), et.short)))),
     h("h2", {}, "Where it happened"),
+    h("div", { class: "chips", role: "group", "aria-label": "Team" },
+      [["Us", "us"], ["Opposition", "them"], ["Both", "all"]].map(([label, v]) =>
+        h("button", { type: "button", class: "chip", "data-team": v, "aria-pressed": String(f.team === v), onclick: () => { f.team = v; if (v === "them") f.playerId = undefined; render(); } }, label))),
     h("div", { class: "chips", role: "group", "aria-label": "Show events" },
       S.EVENT_TYPES.map((et) => h("button", {
         type: "button", class: "chip", "aria-pressed": String(f.types.has(et.id)),
@@ -651,17 +664,14 @@ function viewStats(game) {
     t.byPlayer.size || game.starting.length
       ? [h("p", { class: "muted small" }, "Tap a player to show only their events on the map. Mins = minutes on the pitch."), statsTable(t, { selectable: true, game, minutes: S.playingTime(game) })]
       : h("p", { class: "muted" }, "No events yet."),
-    (game.subs.length > 0 || game.conceded.length > 0) && h("details", { style: "margin-top:20px" },
-      h("summary", { style: "font-weight:700;cursor:pointer;font-size:1.15rem" }, "Subs and goals conceded"),
-      h("ul", { class: "list", style: "margin-top:8px", id: "subs-list" }, [
-        ...game.subs.map((x) => ({ x, kind: "sub" })), ...game.conceded.map((x) => ({ x, kind: "conceded" })),
-      ].sort((a, b) => a.x.half - b.x.half || a.x.t - b.x.t).map(({ x, kind }) => h("li", {},
+    game.subs.length > 0 && h("details", { style: "margin-top:20px" },
+      h("summary", { style: "font-weight:700;cursor:pointer;font-size:1.15rem" }, `Substitutions (${game.subs.length})`),
+      h("ul", { class: "list", style: "margin-top:8px", id: "subs-list" }, [...game.subs].sort((a, b) => a.half - b.half || a.t - b.t).map((x) => h("li", {},
         h("span", { class: "muted small", style: "width:52px;flex:none" }, S.minuteLabel(x, game.halfLength)),
-        h("div", { class: "main" }, kind === "conceded"
-          ? h("div", { class: "primary" }, "Goal conceded")
-          : [h("div", { class: "primary" }, "Substitution"),
-             h("div", { class: "secondary" }, [x.on.length && `On: ${x.on.map((id) => S.gamePlayerLabel(app.state, game, id)).join(", ")}`, x.off.length && `Off: ${x.off.map((id) => S.gamePlayerLabel(app.state, game, id)).join(", ")}`].filter(Boolean).join(" · "))]),
-        h("button", { type: "button", class: "link-btn", onclick: () => commit(() => (kind === "sub" ? S.deleteSub(game, x.id) : S.deleteConceded(game, x.id))) }, "Delete"))))),
+        h("div", { class: "main" },
+          h("div", { class: "primary" }, "Substitution"),
+          h("div", { class: "secondary" }, [x.on.length && `On: ${x.on.map((id) => S.gamePlayerLabel(app.state, game, id)).join(", ")}`, x.off.length && `Off: ${x.off.map((id) => S.gamePlayerLabel(app.state, game, id)).join(", ")}`].filter(Boolean).join(" · "))),
+        h("button", { type: "button", class: "link-btn", onclick: () => commit(() => S.deleteSub(game, x.id)) }, "Delete"))))),
     game.events.length > 0 && h("details", { style: "margin-top:20px" },
       h("summary", { style: "font-weight:700;cursor:pointer;font-size:1.15rem" }, `All events (${game.events.length})`),
       h("ul", { class: "list", style: "margin-top:8px" }, [...game.events].sort((a, b) => b.half - a.half || b.t - a.t).map((e) => eventRow(game, e)))),
@@ -697,7 +707,9 @@ function statsTable(t, { selectable, game, minutes = new Map() }) {
         onclick: selectable ? () => { f.playerId = f.playerId === k ? undefined : k; render(); } : null,
       }, h("td", {}, labelFor(k)), h("td", { class: "num" }, k === "unknown" ? "" : S.formatMinutes(minutes.get(k))), S.EVENT_IDS.map((id) => h("td", { class: "num" }, counts[id] || "·")), h("td", { class: "num" }, sum(counts)));
     })),
-    h("tfoot", {}, h("tr", {}, h("td", {}, "Team"), h("td", {}), S.EVENT_IDS.map((id) => h("td", { class: "num" }, t.total[id])), h("td", { class: "num" }, sum(t.total))))));
+    h("tfoot", {},
+      h("tr", {}, h("td", {}, "Team"), h("td", {}), S.EVENT_IDS.map((id) => h("td", { class: "num" }, t.total[id])), h("td", { class: "num" }, sum(t.total))),
+      game && sum(t.them) > 0 && h("tr", { class: "them-row" }, h("td", {}, "Opposition"), h("td", {}), S.EVENT_IDS.map((id) => h("td", { class: "num" }, t.them[id] || "·")), h("td", { class: "num" }, sum(t.them))))));
 }
 
 function editGame(game) {

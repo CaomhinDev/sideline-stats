@@ -1,22 +1,27 @@
 // Pure data logic: no DOM, no storage. Functions mutate the state they're given.
 
 export const FORMAT = "sideline-stats";
-export const VERSION = 3; // 2: per-game rosters and shirt numbers on events; 3: lineups, subs, goals conceded
+// 2: per-game rosters and shirt numbers on events; 3: lineups, subs, goals conceded;
+// 4: events can belong to the opposition (team "them"), replacing the separate conceded list.
+export const VERSION = 4;
 
 /**
  * What can happen. Ids are stored in saved data, so never rename them; labels are free to change.
  * group drives colour (defending / aerial / attacking), shape tells types apart, positive=false draws hollow.
  */
 export const EVENT_TYPES = [
+  // Good for the team
   { id: "tackle_won", label: "Tackle won", short: "Tkl", group: 0, shape: "circle", positive: true },
   { id: "broken_won", label: "Broken ball won", short: "BB W", group: 0, shape: "hexagon", positive: true },
-  { id: "broken_lost", label: "Broken ball lost", short: "BB L", group: 0, shape: "hexagon", positive: false },
   { id: "air_won", label: "Header won", short: "Hdr W", group: 1, shape: "triangle", positive: true },
-  { id: "air_lost", label: "Header lost", short: "Hdr L", group: 1, shape: "triangle", positive: false },
   { id: "save", label: "Save", short: "Save", group: 1, shape: "diamond", positive: true },
   { id: "shot_on", label: "Shot on target", short: "On T", group: 2, shape: "square", positive: true },
-  { id: "shot_off", label: "Shot off target", short: "Off T", group: 2, shape: "square", positive: false },
   { id: "goal", label: "Goal", short: "Goal", group: 2, shape: "star", positive: true },
+  // Bad for the team
+  { id: "broken_lost", label: "Broken ball lost", short: "BB L", group: 0, shape: "hexagon", positive: false },
+  { id: "air_lost", label: "Header lost", short: "Hdr L", group: 1, shape: "triangle", positive: false },
+  { id: "shot_off", label: "Shot off target", short: "Off T", group: 2, shape: "square", positive: false },
+  { id: "yellow", label: "Yellow card", short: "YC", group: 3, shape: "card", positive: false },
 ];
 export const EVENT_IDS = EVENT_TYPES.map((t) => t.id);
 export const eventType = (id) => EVENT_TYPES.find((t) => t.id === id);
@@ -202,7 +207,6 @@ export function createGame(state, { opponent, date, halfLength, roster }) {
     roster: sheet.roster,
     starting: [], // on the pitch at kick-off
     subs: [], // { id, half, t, on: [ids], off: [ids] }, t in clock seconds like events
-    conceded: [], // { id, half, t }
     periods: [],
     events: [],
   };
@@ -276,16 +280,19 @@ export function minuteLabel(event, halfLength) {
 }
 
 /**
- * playerId null means "unknown player". x: 0 own goal → 1 their goal; y: 0 top → 1 bottom.
+ * team "us" (default) or "them" (the opposition; no player). playerId null = unknown player of ours.
+ * x: 0 own goal → 1 their goal; y: 0 top → 1 bottom.
  * The shirt number worn in this game is kept on the event, so later changes can't rewrite history.
  */
-export function addEvent(state, game, { type, playerId, x, y }, now = Date.now()) {
+export function addEvent(state, game, { type, playerId, team = "us", x, y }, now = Date.now()) {
   if (!EVENT_IDS.includes(type)) throw new Error(`Unknown event type ${type}`);
+  if (team !== "us" && team !== "them") throw new Error(`Unknown team ${team}`);
   const c = clock(game, now);
-  const pid = playerId ?? null;
+  const pid = team === "them" ? null : playerId ?? null;
   const event = {
     id: state.nextId++,
     type,
+    team,
     playerId: pid,
     number: pid == null ? null : (game.roster.find((r) => r.playerId === pid)?.number ?? state.players.find((p) => p.id === pid)?.number ?? null),
     x: Math.round(clamp01(x) * 1000) / 1000,
@@ -377,34 +384,32 @@ export const formatMinutes = (seconds) => `${Math.floor((seconds ?? 0) / 60)}'`;
 
 // ---------------------------------------------------------------- score
 
-export function concede(state, game, now = Date.now()) {
-  const c = clock(game, now);
-  const goal = { id: state.nextId++, half: c.half, t: c.seconds };
-  game.conceded.push(goal);
-  return goal;
-}
-
-export function deleteConceded(game, id) {
-  game.conceded = game.conceded.filter((g) => g.id !== id);
-}
-
-export const score = (game) => ({ us: game.events.filter((e) => e.type === "goal").length, them: game.conceded.length });
+const goals = (game, team) => game.events.filter((e) => e.type === "goal" && (e.team ?? "us") === team).length;
+export const score = (game) => ({ us: goals(game, "us"), them: goals(game, "them") });
 
 // ---------------------------------------------------------------- stats
 
 const zeroCounts = () => Object.fromEntries(EVENT_IDS.map((id) => [id, 0]));
 
-/** Counts per type overall and per player (key "unknown" for no player). */
+/**
+ * Counts per type for our team (total, and per player with key "unknown" for
+ * no player) and, separately, for the opposition (them).
+ */
 export function tally(events) {
   const total = zeroCounts();
+  const them = zeroCounts();
   const byPlayer = new Map();
   for (const e of events) {
+    if (e.team === "them") {
+      them[e.type]++;
+      continue;
+    }
     total[e.type]++;
     const key = e.playerId ?? "unknown";
     if (!byPlayer.has(key)) byPlayer.set(key, zeroCounts());
     byPlayer.get(key)[e.type]++;
   }
-  return { total, byPlayer };
+  return { total, byPlayer, them };
 }
 
 export function seasonTally(state) {
@@ -437,6 +442,7 @@ export function gamePlayerLabel(state, game, id) {
 
 /** One event's player, with the number worn when it happened. */
 export function eventPlayerLabel(state, event) {
+  if (event.team === "them") return "Opposition";
   if (event.playerId == null) return "Unknown";
   return label(event.number, state.players.find((p) => p.id === event.playerId)?.name);
 }
@@ -449,8 +455,7 @@ export function gameCSV(state, game) {
   const name = (id) => state.players.find((p) => p.id === id)?.name ?? "";
   const num = (id) => game.roster.find((r) => r.playerId === id)?.number ?? "";
   const items = [
-    ...game.events.map((e) => ({ ...e, row: [eventType(e.type).label, e.number ?? "", e.playerId == null ? "Unknown" : name(e.playerId), e.x, e.y] })),
-    ...game.conceded.map((g) => ({ ...g, row: ["Goal conceded", "", "", "", ""] })),
+    ...game.events.map((e) => ({ ...e, row: [eventType(e.type).label, e.number ?? "", e.team === "them" ? "Opposition" : e.playerId == null ? "Unknown" : name(e.playerId), e.x ?? "", e.y ?? ""] })),
     ...game.subs.flatMap((sub) => [
       ...sub.off.map((id) => ({ ...sub, row: ["Sub off", num(id), name(id), "", ""] })),
       ...sub.on.map((id) => ({ ...sub, row: ["Sub on", num(id), name(id), "", ""] })),
@@ -513,7 +518,15 @@ export function parseState(text) {
       if (e.playerId != null && !playerIds.has(e.playerId)) throw new Error(`Event ${e.id} belongs to an unknown player.`);
       if (![1, 2].includes(e.half) || !Number.isFinite(e.t) || e.t < 0) throw new Error(`Event ${e.id} has an invalid time.`);
       if (e.number != null && parseNumber(e.number) == null) throw new Error(`Event ${e.id} has an invalid shirt number.`);
-      return { id: e.id, type: e.type, playerId: e.playerId ?? null, number: e.number == null ? null : parseNumber(e.number), x: clamp01(e.x), y: clamp01(e.y), half: e.half, t: Math.floor(e.t) };
+      const team = e.team ?? "us";
+      if (team !== "us" && team !== "them") throw new Error(`Event ${e.id} has an unknown team.`);
+      const noSpot = e.x == null && e.y == null; // goals conceded from version 3 have no location
+      return {
+        id: e.id, type: e.type, team,
+        playerId: team === "them" ? null : e.playerId ?? null,
+        number: team === "them" || e.number == null ? null : parseNumber(e.number),
+        x: noSpot ? null : clamp01(e.x), y: noSpot ? null : clamp01(e.y), half: e.half, t: Math.floor(e.t),
+      };
     });
     // Version 1 stored a list of player ids ("squad"); version 2 a team sheet with numbers.
     const sheet = Array.isArray(g.roster)
@@ -538,7 +551,11 @@ export function parseState(text) {
       return { id: x.id, half: x.half, t: Math.floor(x.t) };
     };
     const subs = (g.subs ?? []).map((x) => ({ ...timed(x, "substitution"), on: known(x.on, "substitution"), off: known(x.off, "substitution") }));
-    const conceded = (g.conceded ?? []).map((x) => timed(x, "goal conceded"));
+    // Version 3 kept goals conceded in their own list; they're now opposition Goal events.
+    for (const x of g.conceded ?? []) {
+      const c = timed(x, "goal conceded");
+      events.push({ ...c, type: "goal", team: "them", playerId: null, number: null, x: null, y: null });
+    }
     state.games.push({
       id: g.id,
       opponent: g.opponent.trim(),
@@ -547,7 +564,6 @@ export function parseState(text) {
       roster: checked.roster,
       starting: known(g.starting, "starting lineup"),
       subs,
-      conceded,
       periods,
       events,
     });

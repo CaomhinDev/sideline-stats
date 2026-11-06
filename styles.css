@@ -22,6 +22,9 @@
   --series-1: #2a78d6;
   --series-2: #eb6834;
   --series-3: #1baf7a;
+  --good-soft: #e3f2e7;
+  --bad-soft: #fbe7e5;
+  --bad-edge: #c9827c;
   --radius: 12px;
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
@@ -35,6 +38,7 @@
     --danger: #f2b8b5; --warn-bg: #3d3100; --warn-text: #ffe08a;
     --grass: #24603a; --grass-2: #205735;
     --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+    --good-soft: #1b2d20; --bad-soft: #35201e; --bad-edge: #8a4a44;
   }
 }
 :root[data-theme="dark"] {
@@ -46,6 +50,7 @@
   --danger: #f2b8b5; --warn-bg: #3d3100; --warn-text: #ffe08a;
   --grass: #24603a; --grass-2: #205735;
   --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+    --good-soft: #1b2d20; --bad-soft: #35201e; --bad-edge: #8a4a44;
 }
 
 * { box-sizing: border-box; }
@@ -155,8 +160,11 @@ body.live main { padding-top: 6px; }
 .step h2 { margin: 0; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-2); }
 .step .done { color: var(--accent); }
 
-/* 3×3: ground duels, then aerial + save, then shots + goal. */
-.events { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 8px; }
+/* Event buttons in two tinted blocks: good for the team (3×2), bad for the team (4×1). */
+.events { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin-bottom: 6px; padding: 4px; border-radius: 12px; }
+.events.good { background: var(--good-soft); }
+.events.bad { background: var(--bad-soft); grid-template-columns: repeat(4, 1fr); }
+.events.bad .ev-btn { flex-direction: column; justify-content: center; gap: 2px; padding: 4px 2px; text-align: center; font-size: 0.78rem; }
 .events .ev-btn[data-event="goal"] { font-size: 1.05rem; }
 .ev-btn, .pl-btn {
   appearance: none; font: inherit; color: var(--text); background: var(--surface);
@@ -172,6 +180,8 @@ body.live main { padding-top: 6px; }
 .players { display: grid; grid-template-columns: repeat(auto-fill, minmax(62px, 1fr)); gap: 6px; margin-bottom: 10px; }
 .pl-btn { min-height: 48px; padding: 4px; display: grid; place-items: center; align-content: center; }
 .pl-btn.bench { opacity: 0.45; border-style: dashed; }
+.pl-btn.them { border-color: var(--bad-edge); background: var(--bad-soft); grid-column: span 2; }
+.pl-btn.them .n { font-size: 1.05rem; }
 .pl-btn .n { font-size: 1.3rem; font-weight: 800; line-height: 1.1; font-variant-numeric: tabular-nums; }
 .pl-btn .nm { font-size: 0.72rem; color: var(--text-2); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ev-btn:active, .pl-btn:active { transform: scale(0.97); }
@@ -179,6 +189,8 @@ body.live main { padding-top: 6px; }
 .sym-0 { fill: var(--series-1); stroke: var(--series-1); }
 .sym-1 { fill: var(--series-2); stroke: var(--series-2); }
 .sym-2 { fill: var(--series-3); stroke: var(--series-3); }
+.sym-card { fill: #f5c400; stroke: #6b5200; stroke-width: 1.2; }
+.pitch .sym-card { stroke-width: 0.35; }
 .sym-hollow { fill: var(--surface); stroke-width: 2.2; }
 .pitch .sym-hollow { fill: var(--grass); }
 .pitch .mark { stroke-width: 0.45; }
@@ -234,9 +246,8 @@ input.roster-num { width: 64px; min-height: 40px; padding: 6px 8px; text-align: 
 
 .score { font-weight: 800; font-variant-numeric: tabular-nums; padding: 1px 8px; border-radius: 8px; background: var(--text); color: var(--bg); flex: none; }
 .score.big { font-size: 1.2rem; vertical-align: middle; }
-.tools { display: grid; grid-template-columns: auto auto auto 1fr; gap: 6px; }
+.tools { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
 .tools .btn { padding: 6px 10px; font-size: 0.85rem; }
-.tools #they-scored { justify-self: end; }
 
 /* Substitutions panel */
 .sub-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(76px, 1fr)); gap: 6px; min-height: 52px; padding: 6px; border-radius: 10px; background: var(--surface-2); margin-bottom: 8px; }
@@ -245,3 +256,8 @@ input.roster-num { width: 64px; min-height: 40px; padding: 6px 8px; text-align: 
 .sub-chip .nm { font-size: 0.72rem; color: var(--text-2); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sub-chip .mins { font-size: 0.72rem; font-weight: 700; color: var(--text-2); }
 .sub-chip.changed { border-color: var(--selected); background: var(--selected-soft); }
+
+.totals .good { box-shadow: inset 0 3px 0 var(--accent); }
+.totals .bad { box-shadow: inset 0 3px 0 var(--bad-edge); }
+.them-badge { margin-left: 6px; vertical-align: middle; background: var(--bad-soft); color: var(--text); }
+tr.them-row td { color: var(--text-2); font-weight: 600; }

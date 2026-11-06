@@ -126,7 +126,7 @@ test("team sheet: per-game numbers, who's playing, and a late addition", async (
   await page.locator('.roster-row[data-player="Lee"] input[type=checkbox]').uncheck();
   await page.getByLabel("Shirt number for Jordan").fill("14");
   await page.locator("#create-game").click();
-  await expect(page.locator(".pl-btn .n")).toHaveText(["1", "7", "14", "?"]);
+  await expect(page.locator(".pl-btn .n")).toHaveText(["1", "7", "14", "?", "Them"]);
 
   // Jordan scores wearing 14.
   await ev(page, "goal").click();
@@ -142,7 +142,7 @@ test("team sheet: per-game numbers, who's playing, and a late addition", async (
   await page.locator("#new-name").fill("Kim");
   await page.locator("#add-to-sheet").click();
   await page.locator("#dialog-ok").click();
-  await expect(page.locator(".pl-btn .n")).toHaveText(["1", "7", "9", "22", "?"]);
+  await expect(page.locator(".pl-btn .n")).toHaveText(["1", "7", "9", "22", "?", "Them"]);
   // The earlier goal still shows the number worn at the time.
   await expect(page.locator("#recent li").first()).toContainText("#14 Jordan");
 
@@ -166,7 +166,7 @@ test("data saved by the first version still loads", async ({ page }) => {
   })));
   await page.reload();
   await page.goto("./#/game/2");
-  await expect(page.locator(".pl-btn .n")).toHaveText(["7", "?"]);
+  await expect(page.locator(".pl-btn .n")).toHaveText(["7", "?", "Them"]);
   await expect(page.locator("#recent li")).toContainText("Header won");
   await expect(page.locator("#recent li")).toContainText("#7 Sam");
 });
@@ -212,7 +212,7 @@ test("lineup, substitutions and minutes played", async ({ page }) => {
   await expect(mins(1)).toHaveText("60'");
   await expect(mins(2)).toHaveText("20'");
   await expect(mins(12)).toHaveText("40'");
-  await page.getByText("Subs and goals conceded").click();
+  await page.getByText("Substitutions (1)").click();
   await expect(page.locator("#subs-list")).toContainText("On: #12 Sub · Off: #2 Alex");
 });
 
@@ -224,14 +224,51 @@ test("score: our goals and theirs, with undo", async ({ page }) => {
   await pl(page, 9).click();
   await tapPitch(page, 0.95, 0.5);
   await expect(page.locator("#score")).toHaveText("1–0");
-  await page.locator("#they-scored").click();
+  // A goal conceded is a Goal credited to Them.
+  const concede = async () => { await ev(page, "goal").click(); await pl(page, "them").click(); await tapPitch(page, 0.03, 0.5); };
+  await concede();
   await expect(page.locator("#score")).toHaveText("1–1");
-  await expect(page.locator("#live-status")).toContainText("Goal conceded");
-  await page.locator("#they-scored").click();
+  await expect(page.locator("#live-status")).toContainText("Conceded: ");
+  await expect(page.locator("#recent li").first()).toContainText("Opposition");
+  // Undo straight away, or delete later from the list.
+  await concede();
   await page.locator("#live-status .undo").click();
+  await expect(page.locator("#score")).toHaveText("1–1");
+  await concede();
+  await expect(page.locator("#score")).toHaveText("1–2");
+  await page.locator("#recent li").first().getByRole("button", { name: /Delete/ }).click();
   await expect(page.locator("#score")).toHaveText("1–1");
   await page.goto("./#/games");
   await expect(page.locator(".list .badge").first()).toContainText("1–1");
+});
+
+test("opposition stats and yellow cards show separately in game stats", async ({ page }) => {
+  await addSquad(page);
+  await newGame(page);
+  const log = async (type, who, fx, fy) => { await ev(page, type).click(); await pl(page, who).click(); await tapPitch(page, fx, fy); };
+  await log("yellow", 4, 0.4, 0.3);
+  await log("yellow", "them", 0.6, 0.3);
+  await log("shot_on", "them", 0.1, 0.5);
+  await log("tackle_won", 9, 0.5, 0.5);
+  await expect(page.locator("#recent li").first()).toContainText("Tackle won");
+  await expect(page.locator("#recent li").nth(1)).toContainText("Them");
+
+  await page.locator("#to-stats").click();
+  await expect(page.locator('[data-total="yellow"]')).toHaveText("1"); // ours only
+  await expect(page.locator("tr.them-row")).toContainText("Opposition");
+  await expect(page.locator("#stats-pitch .mark")).toHaveCount(2); // "Us" by default
+  await page.locator('[data-team="them"]').click();
+  await expect(page.locator("#stats-pitch .mark")).toHaveCount(2);
+  await page.locator('[data-team="all"]').click();
+  await expect(page.locator("#stats-pitch .mark")).toHaveCount(4);
+  await expect(page.locator("#stats-pitch .sym-card")).toHaveCount(2);
+});
+
+test("buttons are grouped good / bad for the team", async ({ page }) => {
+  await addSquad(page);
+  await newGame(page);
+  await expect(page.locator(".events.good .ev-btn")).toHaveText(["Tackle won", "Broken ball won", "Header won", "Save", "Shot on target", "Goal"]);
+  await expect(page.locator(".events.bad .ev-btn")).toHaveText(["Broken ball lost", "Header lost", "Shot off target", "Yellow card"]);
 });
 
 test("broken ball won and lost are logged like other events", async ({ page }) => {
@@ -382,7 +419,7 @@ test("live screen fits a phone: pitch, events and first players without scrollin
   await addSquad(page, SQUAD + "\n17 Ben\n18 Tom\n19 Max\n20 Ollie");
   await newGame(page);
   const vh = 740;
-  for (const sel of ["#pitch", '[data-event="goal"]', '.pl-btn[data-number="unknown"]']) {
+  for (const sel of ["#pitch", '[data-event="yellow"]', '.pl-btn[data-number="them"]']) {
     const box = await page.locator(sel).boundingBox();
     expect(box.y + box.height, sel).toBeLessThanOrEqual(vh);
   }
