@@ -5,10 +5,15 @@
   "scripts": {
     "serve": "python3 -m http.server 8091 --bind 0.0.0.0",
     "test": "node --test tests/*.test.js",
-    "test:e2e": "playwright test",
-    "deploy": "git push origin main"
+    "test:e2e": "firebase emulators:exec --only auth,firestore --project demo-sideline 'playwright test'",
+    "deploy": "git push origin main",
+    "test:rules": "firebase emulators:exec --only firestore --project demo-sideline 'node --test tests/rules/rules.test.js'",
+    "test:live": "playwright test"
   },
   "devDependencies": {
-    "@playwright/test": "^1.56.1"
+    "@firebase/rules-unit-testing": "^4.0.1",
+    "@playwright/test": "^1.56.1",
+    "firebase": "^11.10.0",
+    "firebase-tools": "^14.27.0"
   }
 }

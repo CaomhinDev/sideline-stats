@@ -3,8 +3,37 @@
 
 import { emptyState, parseState } from "./store.js";
 
-const DATA_KEY = "sideline.data.v1";
+// Before accounts, data lived under one key; signed-in data is kept per account
+// so two people on the same phone never see each other's copy.
+const LEGACY_DATA_KEY = "sideline.data.v1";
+let DATA_KEY = LEGACY_DATA_KEY;
 const META_KEY = "sideline.meta.v1";
+
+/** Switches the local copy to this account's (uid) or back to the shared legacy key (null). */
+export function useAccount(uid) {
+  DATA_KEY = uid ? `sideline.data.${uid}` : LEGACY_DATA_KEY;
+}
+
+/** The pre-accounts local data, if any, for a one-time upload. Returns { state } or null. */
+export function loadLegacy() {
+  const raw = read(LEGACY_DATA_KEY);
+  if (raw == null) return null;
+  try {
+    return { state: parseState(raw) };
+  } catch {
+    return null;
+  }
+}
+
+/** Keeps the pre-accounts data under a new name once it has been uploaded. */
+export function retireLegacy(uid) {
+  const raw = read(LEGACY_DATA_KEY);
+  if (raw == null) return;
+  write(`${LEGACY_DATA_KEY}.uploaded-${uid}`, raw);
+  try {
+    localStorage.removeItem(LEGACY_DATA_KEY);
+  } catch {}
+}
 
 function read(key) {
   try {
@@ -77,4 +106,4 @@ export async function requestPersistence() {
   }
 }
 
-export const STORAGE_KEYS = { DATA_KEY, META_KEY };
+export const dataKey = () => DATA_KEY;

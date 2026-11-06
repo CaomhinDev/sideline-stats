@@ -1,10 +1,5 @@
-import { test, expect } from "@playwright/test";
 import fs from "node:fs";
-
-test.beforeEach(async ({ page }) => {
-  page.on("pageerror", (e) => { throw e; });
-  page.on("console", (m) => { if (m.type() === "error") throw new Error(m.text()); });
-});
+import { test, expect, allow, freshEmail, signInAs } from "./fixtures.js";
 
 const SQUAD = "1 Sam Keeper\n2 Alex\n4 Chris\n5 Pat\n7 Jamie\n8 Rory\n9 Jordan\n10 Lee\n11 Dan\n14 Finn\n15 Cian\n16 Oisin";
 
@@ -38,6 +33,22 @@ async function kickOff(page, { everyone = true } = {}) {
   if (everyone) await page.getByRole("button", { name: "Everyone on" }).click();
   await page.locator("#dialog-ok").click();
   await expect(page.locator("#phase-label")).toHaveText("1st half");
+}
+
+/**
+ * Pins the page's clock (Date.now) to a fixed time that the test moves forward
+ * explicitly: at("12:34") = 12m34s after the start. Timers keep running, so
+ * Firebase and the app's 1-second clock tick behave normally.
+ */
+async function useMatchTime(page) {
+  const T0 = new Date("2026-11-07T10:00:00").getTime();
+  let offset = 0;
+  await page.clock.setFixedTime(T0);
+  return async (mmss) => {
+    const [m, sec] = mmss.split(":").map(Number);
+    offset += (m * 60 + sec) * 1000;
+    await page.clock.setFixedTime(T0 + offset);
+  };
 }
 
 const ev = (page, id) => page.locator(`[data-event="${id}"]`);
@@ -158,22 +169,36 @@ test("team sheet: per-game numbers, who's playing, and a late addition", async (
   await expect(page.locator("#squad-list li")).toHaveText([/1\s*Sam/, /7\s*Jamie/, /9\s*Jordan/, /10\s*Lee/, /22\s*Kim/]);
 });
 
-test("data saved by the first version still loads", async ({ page }) => {
+test.describe("before accounts", () => {
+  test.use({ signIn: false });
+  test("data saved by the first version uploads to the account on first sign-in", async ({ page, email }) => {
+  await allow(email);
   await page.goto("./");
+  await expect(page.locator("#sign-in")).toBeVisible();
   await page.evaluate(() => localStorage.setItem("sideline.data.v1", JSON.stringify({
     nextId: 20, players: [{ id: 1, number: 7, name: "Sam" }],
     games: [{ id: 2, opponent: "Old FC", date: "2026-11-01", halfLength: 30, squad: [1], periods: [], events: [{ id: 3, type: "air_won", playerId: 1, x: 0.5, y: 0.5, half: 1, t: 0 }] }],
   })));
   await page.reload();
+  await signInAs(page, email);
   await page.goto("./#/game/2");
   await expect(page.locator(".pl-btn .n")).toHaveText(["7", "?", "Them"]);
   await expect(page.locator("#recent li")).toContainText("Header won");
   await expect(page.locator("#recent li")).toContainText("#7 Sam");
+  // It's in the account now: a fresh browser with no local copy sees it after signing in.
+  const other = await page.context().browser().newContext();
+  const page2 = await other.newPage();
+  await page2.addInitScript(() => { window.__SIDELINE_EMULATOR = true; });
+  await page2.goto(new URL("./", page.url()).href);
+  await signInAs(page2, email);
+  await page2.goto(new URL("./#/games", page.url()).href);
+  await expect(page2.locator(".list li").first()).toContainText("vs Old FC");
+  await other.close();
+  });
 });
 
 test("lineup, substitutions and minutes played", async ({ page }) => {
-  await page.clock.install({ time: new Date("2026-11-07T10:00:00") });
-  await page.clock.pauseAt(new Date("2026-11-07T10:00:01"));
+  const at = await useMatchTime(page);
   await addSquad(page, "1 Sam\n2 Alex\n3 Chris\n12 Sub");
   await newGame(page, "Rovers", "30");
 
@@ -188,7 +213,7 @@ test("lineup, substitutions and minutes played", async ({ page }) => {
   await expect(page.locator('.pl-btn[data-number="2"]')).not.toHaveClass(/bench/);
 
   // 20:00 in, #12 on for #2.
-  await page.clock.fastForward("20:00");
+  await at("20:00");
   await page.locator("#subs-btn").click();
   await expect(page.locator('#sub-on .sub-chip[data-number="2"] .mins')).toHaveText("20'");
   await page.locator('#sub-on .sub-chip[data-number="2"]').click();
@@ -199,11 +224,11 @@ test("lineup, substitutions and minutes played", async ({ page }) => {
   await expect(page.locator('.pl-btn[data-number="2"]')).toHaveClass(/bench/);
 
   // Half time at 30:00; second half full 30 minutes.
-  await page.clock.fastForward("10:00");
+  await at("10:00");
   await page.locator("#phase-btn").click();
   await page.locator("#dialog-ok").click();
   await page.locator("#phase-btn").click();
-  await page.clock.fastForward("30:00");
+  await at("30:00");
   await page.locator("#phase-btn").click();
   await page.locator("#dialog-ok").click();
 
@@ -283,9 +308,7 @@ test("broken ball won and lost are logged like other events", async ({ page }) =
 });
 
 test("clock: start, half time, second half from half length, full time; survives reload", async ({ page }) => {
-  // Freeze time so only runFor() moves the clock.
-  await page.clock.install({ time: new Date("2026-11-07T10:00:00") });
-  await page.clock.pauseAt(new Date("2026-11-07T10:00:01"));
+  const at = await useMatchTime(page);
   await addSquad(page);
   await newGame(page, "City", "25");
   await expect(page.locator("#clock")).toHaveText("00:00");
@@ -293,7 +316,7 @@ test("clock: start, half time, second half from half length, full time; survives
   await kickOff(page);
   await expect(page.locator("#phase-label")).toHaveText("1st half");
 
-  await page.clock.fastForward("12:34");
+  await at("12:34");
   await expect(page.locator("#clock")).toHaveText("12:34");
 
   // An event logged now is stamped 13'.
@@ -303,23 +326,23 @@ test("clock: start, half time, second half from half length, full time; survives
   await expect(page.locator("#recent li").first()).toContainText("13'");
 
   // Phone locked / page reloaded: the clock catches up from timestamps.
-  await page.clock.fastForward("10:00");
+  await at("10:00");
   await page.reload();
   await expect(page.locator("#clock")).toHaveText("22:34");
 
   // Half time asks first, then stops the clock.
-  await page.clock.fastForward("04:00");
+  await at("04:00");
   await page.locator("#phase-btn").click();
   await expect(page.locator("#dialog")).toContainText("Stop the clock at 26:34");
   await page.locator("#dialog-ok").click();
   await expect(page.locator("#phase-label")).toHaveText("Half time");
-  await page.clock.fastForward("08:00");
+  await at("08:00");
   await expect(page.locator("#clock")).toHaveText("26:34");
 
   await page.locator("#phase-btn").click(); // Start 2nd half: no confirmation needed
   await expect(page.locator("#phase-label")).toHaveText("2nd half");
   await expect(page.locator("#clock")).toHaveText("25:00");
-  await page.clock.fastForward("01:05");
+  await at("01:05");
   await expect(page.locator("#clock")).toHaveText("26:05");
   await ev(page, "shot_off").click();
   await pl(page, 10).click();
@@ -370,7 +393,7 @@ test("stats: totals, per-player table, map filters and CSV", async ({ page }) =>
   await expect(page.getByRole("heading", { name: "Season totals" })).toBeVisible();
 });
 
-test("export and import restore everything after storage is cleared", async ({ page }) => {
+test("cleared browser storage comes back from the account; export/import moves data to another account", async ({ page }) => {
   await addSquad(page);
   await newGame(page);
   await ev(page, "shot_on").click();
@@ -387,8 +410,17 @@ test("export and import restore everything after storage is cleared", async ({ p
   await page.evaluate(() => localStorage.clear());
   await page.goto("./#/games");
   await page.reload();
-  await expect(page.getByText("No games yet.")).toBeVisible();
+  await expect(page.locator(".list li").first()).toContainText("vs Rovers"); // from the account
 
+  // A second account starts empty; importing the file gives it the same data.
+  const second = freshEmail("second");
+  await allow(second);
+  await page.goto("./#/data");
+  await page.locator("#sign-out").click();
+  await expect(page.locator("#sign-in")).toBeVisible();
+  await signInAs(page, second);
+  await page.goto("./#/games");
+  await expect(page.getByText("No games yet.")).toBeVisible();
   await page.goto("./#/data");
   await page.locator("#import-file").setInputFiles(file);
   await expect(page.locator("#dialog")).toContainText("12 players and 1 game");
@@ -396,7 +428,7 @@ test("export and import restore everything after storage is cleared", async ({ p
   await expect(page.locator(".list li")).toContainText("vs Rovers");
 });
 
-test("backup reminder appears after a finished game, not during one", async ({ page }) => {
+test("no backup nagging when signed in (the account is the backup)", async ({ page }) => {
   await addSquad(page);
   await newGame(page);
   await kickOff(page);
@@ -410,7 +442,7 @@ test("backup reminder appears after a finished game, not during one", async ({ p
   await page.locator("#dialog-ok").click();
   await expect(page.locator("#banner")).toBeHidden(); // never on the live screen
   await page.goto("./#/games");
-  await expect(page.locator("#banner")).toContainText("haven't backed up");
+  await expect(page.locator("#banner")).toBeHidden();
 });
 
 test("live screen fits a phone: pitch, events and first players without scrolling", async ({ page }) => {
@@ -437,7 +469,97 @@ test("live screen fits a phone: pitch, events and first players without scrollin
 });
 
 test("warns when browser storage is unavailable", async ({ page }) => {
-  await page.addInitScript(() => { Storage.prototype.setItem = () => { throw new DOMException("blocked", "SecurityError"); }; });
+  // Simulate a full or blocked store for the app's own data (Firebase keeps its session elsewhere).
+  await page.addInitScript(() => {
+    const real = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (k, v) {
+      if (String(k).startsWith("sideline.")) throw new DOMException("blocked", "QuotaExceededError");
+      return real.call(this, k, v);
+    };
+  });
   await page.goto("./");
-  await expect(page.locator("#banner")).toContainText("isn't saving your data");
+  await expect(page.locator("#banner")).toContainText("can't keep a copy on this phone");
+});
+
+test.describe("accounts", () => {
+  test.use({ signIn: false });
+
+  test("signed-out visitors see only the sign-in screen", async ({ page }) => {
+    await page.goto("./#/squad");
+    await expect(page.locator("#sign-in")).toBeVisible();
+    await expect(page.locator("#tabs")).toBeHidden();
+  });
+
+  test("an account that isn't on the family list is turned away", async ({ page }) => {
+    await page.goto("./");
+    const stranger = freshEmail("stranger");
+    await signInAs(page, stranger, { expectAccess: false });
+    await expect(page.locator("#gate")).toHaveAttribute("data-access", "denied");
+    await expect(page.locator("#gate")).toContainText(`${stranger} doesn't have access`);
+    await expect(page.locator("#tabs")).toBeHidden();
+  });
+
+  test("the same account on two devices stays in sync", async ({ page, browser, email }) => {
+    await allow(email);
+    await page.goto("./");
+    await signInAs(page, email);
+    const other = await browser.newContext({ ...test.info().project.use });
+    const phone2 = await other.newPage();
+    await phone2.addInitScript(() => { window.__SIDELINE_EMULATOR = true; });
+    await phone2.goto(new URL("./", page.url()).href);
+    await signInAs(phone2, email);
+
+    await addSquad(page, "9 Jordan");
+    await newGame(page, "Sync United");
+    await ev(page, "goal").click();
+    await pl(page, 9).click();
+    await tapPitch(page, 0.95, 0.5);
+
+    await phone2.goto(new URL("./#/games", page.url()).href);
+    await expect(phone2.locator(".list li").first()).toContainText("vs Sync United");
+    await expect(phone2.locator(".list .badge").last()).toContainText("1–0");
+    await other.close();
+  });
+
+  test("a shared game is view-only for family and disappears when unshared", async ({ page, browser }) => {
+    const owner = freshEmail("owner");
+    const brother = freshEmail("brother");
+    await allow(owner);
+    await allow(brother);
+    await page.goto("./");
+    await signInAs(page, owner);
+    const opponent = `Harbour ${Date.now()}`;
+    await addSquad(page, "4 Chris");
+    await newGame(page, opponent);
+    await ev(page, "tackle_won").click();
+    await pl(page, 4).click();
+    await tapPitch(page, 0.4, 0.5);
+
+    const ctx = await browser.newContext({ ...test.info().project.use });
+    const bro = await ctx.newPage();
+    await bro.addInitScript(() => { window.__SIDELINE_EMULATOR = true; });
+    await bro.goto(new URL("./", page.url()).href);
+    await signInAs(bro, brother);
+    const sharedRow = bro.locator("#shared-list li", { hasText: opponent });
+    await expect(sharedRow).toHaveCount(0); // not shared yet
+
+    await page.locator("#to-stats").click();
+    await page.locator("#share-toggle").check();
+    await expect(sharedRow).toHaveCount(1);
+    await sharedRow.locator("a").click();
+    await expect(bro.locator("h1")).toContainText(opponent);
+    await expect(bro.locator("p.muted").first()).toContainText("view only");
+    await expect(bro.locator("tbody")).toContainText("#4 Chris");
+    // No editing controls for a viewer.
+    for (const name of ["Edit details", "Delete game"]) await expect(bro.getByRole("button", { name })).toHaveCount(0);
+    await expect(bro.locator("#share-toggle")).toHaveCount(0);
+    await bro.getByText(/All events/).click();
+    await expect(bro.getByRole("button", { name: /Delete/ })).toHaveCount(0);
+
+    // Owner unshares: it's gone for the viewer.
+    await page.locator("#share-toggle").uncheck();
+    await bro.goto(new URL("./#/games", page.url()).href);
+    await expect(sharedRow).toHaveCount(0);
+    await ctx.close();
+  });
 });

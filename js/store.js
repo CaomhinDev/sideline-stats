@@ -26,6 +26,17 @@ export const EVENT_TYPES = [
 export const EVENT_IDS = EVENT_TYPES.map((t) => t.id);
 export const eventType = (id) => EVENT_TYPES.find((t) => t.id === id);
 
+/**
+ * A new id, unique across devices: time-based (microsecond-ish) and never
+ * below the last one issued, so two phones on one account can't collide.
+ * Stays an integer within JavaScript's safe range.
+ */
+export function newId(state, now = Date.now()) {
+  const id = Math.max(state.nextId, now * 1000 + Math.floor(Math.random() * 1000));
+  state.nextId = id + 1;
+  return id;
+}
+
 export function emptyState() {
   return { nextId: 1, players: [], games: [] };
 }
@@ -65,7 +76,7 @@ export function playerError(state, number, name, exceptId = null) {
 export function addPlayer(state, number, name) {
   const error = playerError(state, number, name);
   if (error) return { error };
-  const player = { id: state.nextId++, number: parseNumber(number), name: String(name ?? "").trim() };
+  const player = { id: newId(state), number: parseNumber(number), name: String(name ?? "").trim() };
   state.players.push(player);
   return { player };
 }
@@ -200,7 +211,7 @@ export function createGame(state, { opponent, date, halfLength, roster }) {
   const sheet = checkRoster(state, roster ?? defaultRoster(state));
   if (sheet.error) return { error: sheet.error };
   const game = {
-    id: state.nextId++,
+    id: newId(state),
     opponent: name.slice(0, 60),
     date: isValidISODate(date) ? date : todayISO(),
     halfLength: len,
@@ -290,7 +301,7 @@ export function addEvent(state, game, { type, playerId, team = "us", x, y }, now
   const c = clock(game, now);
   const pid = team === "them" ? null : playerId ?? null;
   const event = {
-    id: state.nextId++,
+    id: newId(state),
     type,
     team,
     playerId: pid,
@@ -343,8 +354,8 @@ export function setOnPitch(state, game, ids, now = Date.now()) {
   if (!on.length && !off.length) return null;
   const c = clock(game, now);
   const sub = p === "half"
-    ? { id: state.nextId++, half: 2, t: game.halfLength * 60, on, off }
-    : { id: state.nextId++, half: c.half, t: c.seconds, on, off };
+    ? { id: newId(state), half: 2, t: game.halfLength * 60, on, off }
+    : { id: newId(state), half: c.half, t: c.seconds, on, off };
   game.subs.push(sub);
   return sub;
 }
@@ -562,6 +573,7 @@ export function parseState(text) {
       date: isValidISODate(g.date) ? g.date : todayISO(),
       halfLength: g.halfLength,
       roster: checked.roster,
+      ...(g.shared === true ? { shared: true } : {}),
       starting: known(g.starting, "starting lineup"),
       subs,
       periods,

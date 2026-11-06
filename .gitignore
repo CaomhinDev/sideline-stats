@@ -2,3 +2,10 @@ node_modules/
 test-results/
 playwright-report/
 screenshots/
+# Firebase emulator / CLI logs
+*-debug.log
+firebase-debug.*.log
+.firebase/
+# Never commit credentials
+.env*
+*service-account*.json

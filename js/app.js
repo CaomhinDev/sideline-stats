@@ -1,15 +1,28 @@
 import * as S from "./store.js";
 import * as storage from "./storage.js";
 
+// Firebase loads from Google's CDN. If it can't (offline on first open), the app
+// still runs from this phone's copy for the last signed-in account and syncs later.
+let cloud = null;
+try {
+  cloud = await import("./cloud.js");
+} catch (e) {
+  console.warn("Cloud sync unavailable:", e);
+}
+
 // ---------------------------------------------------------------- state
 
-const loaded = storage.loadState();
 const app = {
-  state: loaded.state,
+  state: S.emptyState(),
   meta: storage.loadMeta(),
-  loadProblem: loaded.problem,
+  loadProblem: null,
   storageOk: storage.storageAvailable(),
   persisted: null,
+  // Account: access is "checking" | "signed-out" | "denied" | "unverifiable" | "no-cloud" | "allowed"
+  user: null,
+  access: "checking",
+  authError: null,
+  shared: [], // games others have shared: [{ docId, ownerName, names, game }]
   route: { name: "games" },
   pending: null, // live entry: { gameId, x, y, type, playerId } – playerId undefined = not chosen, null = unknown
   statsFilter: { half: 0, types: new Set(S.EVENT_IDS), playerId: undefined },
@@ -20,12 +33,214 @@ function commit(mutate, { rerender = true } = {}) {
   app.storageOk = storage.saveState(app.state);
   app.meta.changesSinceExport = (app.meta.changesSinceExport ?? 0) + 1;
   storage.saveMeta(app.meta);
+  pushChanges();
   if (rerender) render();
   return result;
 }
 
+// ---------------------------------------------------------------- account & sync
+
+// What we last sent to (or received from) Firestore, as JSON, so only real changes are written.
+const sent = { players: null, games: new Map() };
+let stopWatching = [];
+
+/** Names (and usual numbers) of everyone in a game, so family can view it without your squad. */
+function namesFor(game) {
+  const ids = new Set([...game.roster.map((r) => r.playerId), ...game.events.map((e) => e.playerId).filter((id) => id != null)]);
+  const out = {};
+  for (const id of ids) {
+    const p = app.state.players.find((p) => p.id === id);
+    if (p) out[id] = { number: p.number, name: p.name };
+  }
+  return out;
+}
+
+// Writes not yet confirmed by Firebase. While any are outstanding, an incoming
+// snapshot may predate them, so it's held back (and applied once they settle).
+let inFlight = 0;
+let heldBack = null;
+
+function track(promise) {
+  inFlight++;
+  promise.catch(syncFailed).finally(() => {
+    inFlight--;
+    if (inFlight === 0 && heldBack) {
+      const args = heldBack;
+      heldBack = null;
+      receive(...args);
+    }
+  });
+}
+
+function syncFailed(e) {
+  console.warn("Sync failed:", e);
+  if (e?.code === "permission-denied") {
+    app.access = "denied";
+    render();
+  }
+}
+
+/** Writes anything that changed since the last sync. Firestore queues writes while offline. */
+function pushChanges() {
+  if (!app.user || app.access !== "allowed") return;
+  if (!cloud) {
+    app.meta.unsynced = { ...app.meta.unsynced, [app.user.uid]: true };
+    saveMeta();
+    return;
+  }
+  const uid = app.user.uid;
+  const players = JSON.stringify(app.state.players);
+  if (players !== sent.players) {
+    sent.players = players;
+    track(cloud.saveUser(uid, { players: app.state.players }));
+  }
+  const live = new Set();
+  for (const g of app.state.games) {
+    live.add(g.id);
+    const json = JSON.stringify(g);
+    if (sent.games.get(g.id) !== json) {
+      sent.games.set(g.id, json);
+      track(cloud.saveGame(app.user, g, namesFor(g)));
+    }
+  }
+  for (const id of [...sent.games.keys()]) {
+    if (!live.has(id)) {
+      sent.games.delete(id);
+      track(cloud.removeGame(uid, id));
+    }
+  }
+}
+
+let reconciled = false;
+
+/** Applies your squad and games from Firestore (another device, or after reconnecting). */
+function receive(user, games, fromServer) {
+  if (inFlight > 0 && reconciled) {
+    heldBack = [user, games, fromServer];
+    return;
+  }
+  if (!reconciled) {
+    // Wait for the server's answer before deciding anything about a first sign-in.
+    if (!fromServer) return;
+    reconciled = true;
+    document.body.dataset.sync = "ready";
+    const cloudEmpty = !user && games.length === 0;
+    const unsynced = app.meta.unsynced?.[app.user.uid];
+    if (cloudEmpty) {
+      // First sign-in: upload this phone's data (from before accounts, if that's all there is).
+      const legacy = storage.loadLegacy();
+      if (!app.state.players.length && !app.state.games.length && legacy) {
+        app.state = legacy.state;
+        storage.saveState(app.state);
+        storage.retireLegacy(app.user.uid);
+        toast("Your existing squad and games are now saved to your account.");
+        render();
+      }
+      pushChanges();
+      return;
+    }
+    if (unsynced) {
+      // Changes made while Firebase couldn't load: keep them, and anything only in the cloud.
+      const mine = new Set(app.state.games.map((g) => g.id));
+      app.state.games.push(...parseGames(games).filter((g) => !mine.has(g.id)));
+      app.meta.unsynced = { ...app.meta.unsynced, [app.user.uid]: false };
+      saveMeta();
+      pushChanges();
+      render();
+      return;
+    }
+  }
+  let incoming;
+  try {
+    incoming = S.parseState({ players: user?.players ?? [], games });
+  } catch (e) {
+    console.warn("Ignoring unreadable cloud data:", e);
+    return;
+  }
+  // Usually this is just our own write coming back: keep the same objects (open
+  // dialogs and Undo buttons hold references to them) unless something really changed.
+  if (canonical(incoming) === canonical(app.state)) return;
+  incoming.nextId = Math.max(incoming.nextId, app.state.nextId);
+  sent.players = JSON.stringify(incoming.players);
+  sent.games = new Map(incoming.games.map((g) => [g.id, JSON.stringify(g)]));
+  app.state = incoming;
+  storage.saveState(app.state);
+  render();
+}
+
+/** Squad and games in a fixed shape and order, for comparing two copies. */
+function canonical(state) {
+  try {
+    const st = S.parseState({ players: state.players, games: state.games });
+    st.games.sort((a, b) => a.id - b.id);
+    return JSON.stringify({ players: st.players, games: st.games });
+  } catch {
+    return Math.random().toString(); // unreadable: treat as different
+  }
+}
+
+function parseGames(games) {
+  try {
+    return S.parseState({ players: app.state.players, games }).games;
+  } catch {
+    return [];
+  }
+}
+
+async function startAccount(user) {
+  delete document.body.dataset.sync; // set to "ready" once this account's first sync is done
+  stopWatching.forEach((stop) => stop());
+  stopWatching = [];
+  reconciled = false;
+  inFlight = 0;
+  heldBack = null;
+  sent.players = null;
+  sent.games = new Map();
+  app.shared = [];
+  app.user = user;
+  app.authError = null;
+  if (!user) {
+    app.access = "signed-out";
+    app.state = S.emptyState();
+    storage.useAccount(null);
+    render();
+    return;
+  }
+  // Show this account's copy on this phone straight away.
+  storage.useAccount(user.uid);
+  const local = storage.loadState();
+  app.state = local.state;
+  app.loadProblem = local.problem;
+  app.access = "checking";
+  render();
+
+  let ok = cloud ? await cloud.isAllowed(user) : null;
+  if (ok === null) ok = app.meta.allowed?.[user.uid] ?? null; // offline: trust the last answer
+  if (app.user !== user) return; // signed out meanwhile
+  if (ok !== true) {
+    app.access = ok === false ? "denied" : "unverifiable";
+    render();
+    return;
+  }
+  app.meta.allowed = { ...app.meta.allowed, [user.uid]: true };
+  app.meta.lastUser = user;
+  saveMeta();
+  app.access = "allowed";
+  render();
+  if (!cloud) {
+    document.body.dataset.sync = "ready";
+    return;
+  }
+  stopWatching.push(
+    cloud.watchMine(user.uid, receive, syncFailed),
+    cloud.watchShared(user.uid, (list) => { app.shared = list; if (["games", "shared"].includes(app.route.name)) render(); }, (e) => console.warn("Shared games unavailable:", e)),
+  );
+}
+
 const saveMeta = () => storage.saveMeta(app.meta);
 const findGame = (id) => app.state.games.find((g) => g.id === id);
+/** The live copy of a game, for callbacks that run later (the data may have been refreshed from another device). */
+const current = (game) => findGame(game.id) ?? game;
 
 // ---------------------------------------------------------------- formatting
 
@@ -194,6 +409,7 @@ async function importFile(file) {
 function parseRoute() {
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   if (parts[0] === "game" && parts[1]) return { name: parts[2] === "stats" ? "stats" : "live", id: Number(parts[1]) };
+  if (parts[0] === "shared" && parts[1]) return { name: "shared", docId: decodeURIComponent(parts[1]) };
   if (["games", "squad", "data", "new"].includes(parts[0])) return { name: parts[0] };
   return { name: "games" };
 }
@@ -215,6 +431,14 @@ window.addEventListener("hashchange", () => {
 const view = document.getElementById("view");
 
 function render() {
+  if (app.access !== "allowed") {
+    document.body.classList.remove("live");
+    document.getElementById("tabs").hidden = true;
+    document.getElementById("banner").hidden = true;
+    view.replaceChildren(viewGate());
+    updateWakeLock(false);
+    return;
+  }
   const r = app.route;
   const game = r.id != null ? findGame(r.id) : null;
   if ((r.name === "live" || r.name === "stats") && !game) {
@@ -225,13 +449,13 @@ function render() {
   const live = r.name === "live";
   document.body.classList.toggle("live", live);
   document.getElementById("tabs").hidden = live;
-  const tab = r.name === "new" || r.name === "stats" ? "games" : r.name;
+  const tab = ["new", "stats", "shared"].includes(r.name) ? "games" : r.name;
   for (const a of document.querySelectorAll(".tabs a")) {
     if (a.dataset.tab === tab) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
   }
   renderBanner(live);
-  const views = { games: viewGames, new: viewNewGame, live: () => viewLive(game), stats: () => viewStats(game), squad: viewSquad, data: viewData };
+  const views = { games: viewGames, new: viewNewGame, live: () => viewLive(game), stats: () => viewStats(game), shared: viewShared, squad: viewSquad, data: viewData };
   view.replaceChildren(views[r.name]());
   updateWakeLock(live && S.clock(game).running);
   tick();
@@ -242,11 +466,11 @@ function renderBanner(live) {
   const m = app.meta;
   let content = null;
   if (!app.storageOk) {
-    content = [h("span", {}, "This browser isn't saving your data (storage is blocked or full). Export to keep it."),
+    content = [h("span", {}, "This browser can't keep a copy on this phone (storage is blocked or full), so it needs a connection to save. Export to be safe."),
       h("button", { type: "button", class: "btn btn-small", onclick: exportData }, "Export now")];
   } else if (app.loadProblem) {
     content = [h("span", {}, app.loadProblem), h("button", { type: "button", class: "btn btn-small btn-quiet", onclick: () => { app.loadProblem = null; render(); } }, "Dismiss")];
-  } else if (!live && m.changesSinceExport > 0) {
+  } else if (!live && !cloud && m.changesSinceExport > 0) {
     // Nudge after a finished game, or after a fortnight, but never mid-game.
     const finishedSince = app.state.games.some((g) => S.phase(g) === "full" && g.periods[1].end > Date.parse(m.lastExportAt ?? 0));
     const stale = m.lastExportAt && Date.now() - Date.parse(m.lastExportAt) > 14 * 86_400_000;
@@ -257,6 +481,70 @@ function renderBanner(live) {
   }
   banner.hidden = !content;
   banner.replaceChildren(...(content ?? []));
+}
+
+// ---- Sign-in gate
+
+function viewGate() {
+  const signInBtn = (label = "Sign in with Google") => h("button", {
+    type: "button", class: "btn btn-block", id: "sign-in",
+    onclick: async () => {
+      app.authError = null;
+      try {
+        await cloud.signIn();
+      } catch (e) {
+        app.authError = e?.message ?? String(e);
+        render();
+      }
+    },
+  }, label);
+  const signOutBtn = (label) => h("button", { type: "button", class: "btn btn-quiet btn-block", onclick: () => cloud?.signOut() }, label);
+  const screens = {
+    checking: [h("p", { class: "muted" }, "Checking your account…")],
+    "signed-out": [
+      h("p", {}, "Log match events from the sideline in three taps."),
+      h("p", { class: "muted" }, "Sign in with the Google account you've been given access with."),
+      cloud ? signInBtn() : h("p", {}, "Can't reach Google right now. Check your connection and reload."),
+    ],
+    denied: [
+      h("p", {}, h("strong", {}, app.user?.email), " doesn't have access to Sideline Stats."),
+      h("p", { class: "muted" }, "Ask the owner to add this Google account to the family list, or sign in with a different account."),
+      signOutBtn("Use a different account"),
+    ],
+    unverifiable: [
+      h("p", {}, "Can't check your access while offline."),
+      h("p", { class: "muted" }, "Connect to the internet and reload. After the first check, the app works offline."),
+      h("button", { type: "button", class: "btn btn-block", onclick: () => location.reload() }, "Try again"),
+    ],
+    "no-cloud": [
+      h("p", {}, "Sideline Stats needs an internet connection the first time you sign in on this device."),
+      h("button", { type: "button", class: "btn btn-block", onclick: () => location.reload() }, "Try again"),
+    ],
+  };
+  return h("section", { class: "gate", id: "gate", "data-access": app.access },
+    h("img", { src: "icon.svg", alt: "", width: 64, height: 64 }),
+    h("h1", {}, "Sideline Stats"),
+    screens[app.access] ?? screens.checking,
+    app.authError && h("p", { class: "field-error" }, app.authError));
+}
+
+// ---- Shared with me (view only)
+
+function viewShared() {
+  const item = app.shared.find((x) => x.docId === app.route.docId);
+  if (!item) {
+    return h("section", {}, h("a", { class: "link-btn", href: "#/games" }, "‹ Games"),
+      h("h1", {}, "Not available"),
+      h("p", { class: "muted" }, app.shared.length ? "This game is no longer shared with you." : "Loading shared games…"));
+  }
+  const players = Object.entries(item.names ?? {}).map(([id, p]) => ({ id: Number(id), number: p.number, name: p.name ?? "" }));
+  let st;
+  try {
+    st = S.parseState({ players, games: [item.game] });
+  } catch (e) {
+    return h("section", {}, h("a", { class: "link-btn", href: "#/games" }, "‹ Games"), h("h1", {}, "Can't show this game"), h("p", { class: "muted" }, e.message));
+  }
+  return viewStats(st.games[0], { st, readOnly: true, sharedBy: item.ownerName || "family" });
 }
 
 // ---- Games list
@@ -281,10 +569,22 @@ function viewGames() {
             h("a", { class: "main", href: `#/game/${g.id}` },
               h("div", { class: "primary" }, `vs ${g.opponent}`),
               h("div", { class: "secondary" }, `${fmtDate(g.date)} · ${plural(g.events.length, "event")}`)),
+            g.shared && h("span", { class: "badge", title: "Shared with family (view only)" }, "Shared"),
             h("span", { class: `badge${c.running ? " live" : ""}` }, status),
             h("a", { class: "link-btn", href: `#/game/${g.id}/stats` }, "Stats"));
         }))
       : h("p", { class: "muted", style: "margin-top:16px" }, "No games yet."),
+    app.shared.length > 0 && [
+      h("h2", {}, "Shared with me"),
+      h("p", { class: "muted small" }, "Games family members have shared. View only."),
+      h("ul", { class: "list", id: "shared-list" }, [...app.shared].sort((a, b) => (a.game.date < b.game.date ? 1 : -1)).map((x) => {
+        const sc = S.score(x.game);
+        return h("li", {},
+          h("a", { class: "main", href: `#/shared/${encodeURIComponent(x.docId)}` },
+            h("div", { class: "primary" }, `vs ${x.game.opponent}`),
+            h("div", { class: "secondary" }, `${fmtDate(x.game.date)} · by ${x.ownerName || "family"}`)),
+          h("span", { class: "badge" }, `${sc.us}–${sc.them} · ${PHASE_LABEL[S.phase(x.game)]}`));
+      }))],
     season.byPlayer.size > 0 && [h("h2", {}, "Season totals"), statsTable(season, { selectable: false, minutes: S.seasonPlayingTime(st) })]);
 }
 
@@ -413,25 +713,25 @@ function afterPick(game) {
     navigator.vibrate?.(30);
     render();
     toast(`${ev.type === "goal" ? (team === "them" ? "Conceded: " : "GOAL! ") : ""}${S.minuteLabel(ev, game.halfLength)} ${S.eventPlayerLabel(app.state, ev)} · ${S.eventType(ev.type).label}`,
-      () => commit(() => S.deleteEvent(game, ev.id)));
+      () => commit(() => S.deleteEvent(current(game), ev.id)));
   } else {
     render();
   }
 }
 
-function eventRow(game, e) {
+function eventRow(game, e, { st = app.state, readOnly = false } = {}) {
   return h("li", { "data-event-id": e.id },
     h("span", { class: "muted small", style: "width:52px;flex:none;font-variant-numeric:tabular-nums" }, S.minuteLabel(e, game.halfLength)),
     symbolIcon(e.type, 18),
     h("div", { class: "main" },
       h("div", { class: "primary" }, S.eventType(e.type).label, e.team === "them" && h("span", { class: "badge them-badge" }, "Them")),
-      h("div", { class: "secondary" }, S.eventPlayerLabel(app.state, e))),
-    h("button", {
+      h("div", { class: "secondary" }, S.eventPlayerLabel(st, e))),
+    !readOnly && h("button", {
       type: "button", class: "link-btn", "aria-label": `Delete ${S.eventType(e.type).label} at ${S.minuteLabel(e, game.halfLength)}`,
       onclick: () => {
         const copy = { ...e };
-        commit(() => S.deleteEvent(game, e.id));
-        toast("Event deleted.", () => commit(() => game.events.push(copy)));
+        commit(() => S.deleteEvent(current(game), e.id));
+        toast("Event deleted.", () => commit(() => current(game).events.push(copy)));
       },
     }, "Delete"));
 }
@@ -444,9 +744,9 @@ function phaseAction(game, { lineupDone = false } = {}) {
     return;
   }
   const doIt = () => {
-    commit(() => S.advancePhase(game));
+    commit(() => S.advancePhase(current(game)));
     const label = PHASE_LABEL[S.phase(game)];
-    toast(p === "pre" ? "Kick-off! Clock running." : p === "half" ? "Second half started." : `${label}.`, () => commit(() => S.undoPhase(game)));
+    toast(p === "pre" ? "Kick-off! Clock running." : p === "half" ? "Second half started." : `${label}.`, () => commit(() => S.undoPhase(current(game))));
   };
   if (p === "first" || p === "second") {
     const c = S.clock(game);
@@ -497,13 +797,13 @@ function subsDialog(game, { kickOff } = {}) {
     body,
     okLabel: kickOff ? "Kick off" : "Done",
     onOk: () => {
-      const sub = commit(() => S.setOnPitch(app.state, game, [...on]));
+      const sub = commit(() => S.setOnPitch(app.state, current(game), [...on]));
       if (kickOff) {
         kickOff();
       } else if (sub) {
         const names = (ids) => ids.map((id) => `#${game.roster.find((r) => r.playerId === id)?.number}`).join(", ");
         toast(`Sub ${S.minuteLabel(sub, game.halfLength)}${sub.on.length ? ` · on ${names(sub.on)}` : ""}${sub.off.length ? ` · off ${names(sub.off)}` : ""}`,
-          () => commit(() => S.deleteSub(game, sub.id)));
+          () => commit(() => S.deleteSub(current(game), sub.id)));
       }
     },
   });
@@ -518,7 +818,7 @@ function editMatchday(game) {
     onOk: () => {
       const res = S.checkRoster(app.state, sheet.read());
       if (res.error) return res.error;
-      commit(() => S.setRoster(app.state, game, sheet.read()));
+      commit(() => S.setRoster(app.state, current(game), sheet.read()));
     },
   });
 }
@@ -623,7 +923,11 @@ function pitchSvg({ marks, pending, onTap, label, highlight }) {
 
 // ---- Stats
 
-function viewStats(game) {
+/**
+ * Game stats. For a game someone has shared with you, st holds just that game's
+ * player names and readOnly hides every editing control.
+ */
+function viewStats(game, { st = app.state, readOnly = false, sharedBy = null } = {}) {
   const f = app.statsFilter;
   if (f.gameId !== game.id) Object.assign(f, { gameId: game.id, half: 0, types: new Set(S.EVENT_IDS), playerId: undefined, team: "us" });
   const inHalf = game.events.filter((e) => !f.half || e.half === f.half);
@@ -636,10 +940,13 @@ function viewStats(game) {
 
   return h("section", {},
     h("div", { class: "step", style: "margin:4px 0 12px" },
-      h("a", { class: "link-btn", href: `#/game/${game.id}` }, "‹ Back to game"),
-      h("span", { class: "badge" }, PHASE_LABEL[c.phase])),
+      readOnly ? h("a", { class: "link-btn", href: "#/games" }, "‹ Games") : h("a", { class: "link-btn", href: `#/game/${game.id}` }, "‹ Back to game"),
+      h("span", { class: `badge${c.running ? " live" : ""}` }, c.running ? `${PHASE_LABEL[c.phase]} ${S.formatClock(c.seconds)}` : PHASE_LABEL[c.phase])),
     h("h1", { style: "margin-bottom:4px" }, `vs ${game.opponent}`, " ", h("span", { class: "score big", id: "stats-score" }, `${S.score(game).us}–${S.score(game).them}`)),
-    h("p", { class: "muted" }, fmtDate(game.date)),
+    h("p", { class: "muted" }, fmtDate(game.date), sharedBy && ` · shared by ${sharedBy} (view only)`),
+    !readOnly && h("label", { class: "share-toggle" },
+      h("input", { type: "checkbox", id: "share-toggle", checked: game.shared === true, onchange: (e) => commit(() => { game.shared = e.target.checked; }) }),
+      h("span", {}, h("strong", {}, "Share with family"), h("br"), h("span", { class: "muted small" }, "Everyone on your family list can view this game. Only you can change it."))),
     h("div", { class: "chips", role: "group", "aria-label": "Half" },
       [["Both halves", 0], ["1st half", 1], ["2nd half", 2]].map(([label, v]) =>
         h("button", { type: "button", class: "chip", "aria-pressed": String(f.half === v), onclick: () => { f.half = v; render(); } }, label))),
@@ -656,13 +963,13 @@ function viewStats(game) {
         type: "button", class: "chip", "aria-pressed": String(f.types.has(et.id)),
         onclick: () => { f.types.has(et.id) ? f.types.delete(et.id) : f.types.add(et.id); render(); },
       }, symbolIcon(et.id, 14), et.label))),
-    f.playerId !== undefined && h("p", { class: "small" }, `Showing ${S.gamePlayerLabel(app.state, game, f.playerId)} only. `,
+    f.playerId !== undefined && h("p", { class: "small" }, `Showing ${S.gamePlayerLabel(st, game, f.playerId)} only. `,
       h("button", { type: "button", class: "link-btn", onclick: () => { f.playerId = undefined; render(); } }, "Show everyone")),
     pitchSvg({ marks: shown, label: `Pitch map of ${plural(shown.length, "event")}. Your team attacks to the right.` }),
     h("p", { class: "muted small", style: "margin-top:6px" }, "Attacking →. Filled = won / on target, hollow = lost / off target."),
     h("h2", {}, "By player"),
     t.byPlayer.size || game.starting.length
-      ? [h("p", { class: "muted small" }, "Tap a player to show only their events on the map. Mins = minutes on the pitch."), statsTable(t, { selectable: true, game, minutes: S.playingTime(game) })]
+      ? [h("p", { class: "muted small" }, "Tap a player to show only their events on the map. Mins = minutes on the pitch."), statsTable(t, { selectable: true, game, st, minutes: S.playingTime(game) })]
       : h("p", { class: "muted" }, "No events yet."),
     game.subs.length > 0 && h("details", { style: "margin-top:20px" },
       h("summary", { style: "font-weight:700;cursor:pointer;font-size:1.15rem" }, `Substitutions (${game.subs.length})`),
@@ -670,25 +977,25 @@ function viewStats(game) {
         h("span", { class: "muted small", style: "width:52px;flex:none" }, S.minuteLabel(x, game.halfLength)),
         h("div", { class: "main" },
           h("div", { class: "primary" }, "Substitution"),
-          h("div", { class: "secondary" }, [x.on.length && `On: ${x.on.map((id) => S.gamePlayerLabel(app.state, game, id)).join(", ")}`, x.off.length && `Off: ${x.off.map((id) => S.gamePlayerLabel(app.state, game, id)).join(", ")}`].filter(Boolean).join(" · "))),
-        h("button", { type: "button", class: "link-btn", onclick: () => commit(() => S.deleteSub(game, x.id)) }, "Delete"))))),
+          h("div", { class: "secondary" }, [x.on.length && `On: ${x.on.map((id) => S.gamePlayerLabel(st, game, id)).join(", ")}`, x.off.length && `Off: ${x.off.map((id) => S.gamePlayerLabel(st, game, id)).join(", ")}`].filter(Boolean).join(" · "))),
+        !readOnly && h("button", { type: "button", class: "link-btn", onclick: () => commit(() => S.deleteSub(game, x.id)) }, "Delete"))))),
     game.events.length > 0 && h("details", { style: "margin-top:20px" },
       h("summary", { style: "font-weight:700;cursor:pointer;font-size:1.15rem" }, `All events (${game.events.length})`),
-      h("ul", { class: "list", style: "margin-top:8px" }, [...game.events].sort((a, b) => b.half - a.half || b.t - a.t).map((e) => eventRow(game, e)))),
+      h("ul", { class: "list", style: "margin-top:8px" }, [...game.events].sort((a, b) => b.half - a.half || b.t - a.t).map((e) => eventRow(game, e, { st, readOnly })))),
     h("h2", {}, "Game"),
     h("div", { class: "row", style: "flex-wrap:wrap" },
-      h("button", { type: "button", class: "btn btn-quiet", onclick: () => download(`${game.date}-vs-${game.opponent.replace(/[^\w-]+/g, "-")}.csv`, S.gameCSV(app.state, game), "text/csv") }, "Download CSV"),
-      h("button", { type: "button", class: "btn btn-quiet", onclick: () => editGame(game) }, "Edit details"),
-      h("button", { type: "button", class: "btn btn-danger", onclick: () => openDialog({
+      h("button", { type: "button", class: "btn btn-quiet", onclick: () => download(`${game.date}-vs-${game.opponent.replace(/[^\w-]+/g, "-")}.csv`, S.gameCSV(st, game), "text/csv") }, "Download CSV"),
+      !readOnly && h("button", { type: "button", class: "btn btn-quiet", onclick: () => editGame(game) }, "Edit details"),
+      !readOnly && h("button", { type: "button", class: "btn btn-danger", onclick: () => openDialog({
         title: `Delete game vs ${game.opponent}?`, body: h("p", {}, `This deletes its ${plural(game.events.length, "event")}. It can't be undone unless you have an export.`),
-        okLabel: "Delete", danger: true, onOk: () => { commit(() => S.deleteGame(app.state, game.id), { rerender: false }); go("#/games"); },
+        okLabel: "Delete", danger: true, onOk: () => { commit(() => S.deleteGame(st, game.id), { rerender: false }); go("#/games"); },
       }) }, "Delete game")));
 }
 
 /** With a game, players are labelled and sorted by the number they wore in it. */
-function statsTable(t, { selectable, game, minutes = new Map() }) {
-  const labelFor = (k) => (game ? S.gamePlayerLabel(app.state, game, k) : S.playerLabel(app.state, k));
-  const numberFor = (k) => game?.roster.find((r) => r.playerId === k)?.number ?? app.state.players.find((p) => p.id === k)?.number ?? 0;
+function statsTable(t, { selectable, game, minutes = new Map(), st = app.state }) {
+  const labelFor = (k) => (game ? S.gamePlayerLabel(st, game, k) : S.playerLabel(st, k));
+  const numberFor = (k) => game?.roster.find((r) => r.playerId === k)?.number ?? st.players.find((p) => p.id === k)?.number ?? 0;
   const f = app.statsFilter;
   // Everyone who played or did something, even if one without the other.
   const keys = [...new Set([...t.byPlayer.keys(), ...[...minutes].filter(([, s]) => s > 0).map(([id]) => id)])].sort((a, b) => {
@@ -831,27 +1138,28 @@ function viewData() {
     onchange: (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) importFile(f); } });
   return h("section", {},
     h("h1", {}, "Your data"),
+    h("div", { class: "card", id: "account" },
+      h("p", {}, "Signed in as ", h("strong", {}, app.user?.email), "."),
+      h("p", { class: "muted small" }, cloud
+        ? "Your squad and games save to your account after every tap, and a copy is kept on this phone so it works without signal. Changes made offline upload when you reconnect."
+        : "Working offline from this phone's copy. Changes will upload next time the app opens with a connection."),
+      h("button", { type: "button", class: "btn btn-quiet btn-small", id: "sign-out", onclick: () => cloud?.signOut() }, "Sign out")),
     h("div", { class: "card" },
-      h("p", {}, "Everything is stored in this browser on this device only. Nothing is sent anywhere."),
-      h("p", { class: "muted small" },
-        app.storageOk ? "✓ Saving automatically after every tap." : "✗ Browser storage isn't available. Export to keep your data.",
-        app.persisted === true ? " The browser has agreed not to clear it automatically." : "",
-        app.persisted === false ? " The browser may clear it if space runs low or site data is cleared." : ""),
       h("p", { class: "muted small", style: "margin:0" }, `${plural(S.activePlayers(st).length, "player")}, ${plural(st.games.length, "game")}, ${plural(events, "event")}.`)),
     h("h2", {}, "Back up"),
-    h("p", {}, "Download everything as a JSON file. Keep it safe, or use it to move to another phone or browser."),
+    h("p", {}, "Download everything as a JSON file, as an extra copy outside your account."),
     h("p", { class: "muted small" }, m.lastExportAt
       ? `Last export: ${new Date(m.lastExportAt).toLocaleString()}${m.changesSinceExport ? ` (${plural(m.changesSinceExport, "change")} since)` : " (up to date)"}.`
       : "Not exported yet."),
     h("button", { type: "button", class: "btn", id: "export", onclick: exportData }, "Export JSON"),
     h("h2", {}, "Restore"),
-    h("p", {}, "Load a JSON file you exported earlier. It replaces the data in this browser."),
+    h("p", {}, "Load a JSON file you exported earlier. It replaces your squad and games, in your account too."),
     file,
     h("label", { for: "import-file", class: "btn btn-quiet", style: "margin:0" }, "Import JSON…"),
     (st.players.length > 0 || st.games.length > 0) && [
       h("h2", {}, "Start over"),
       h("button", { type: "button", class: "btn btn-danger", onclick: () => openDialog({
-        title: "Delete all data?", body: h("p", {}, "This removes the squad and every game from this browser. Export first if you might want it back."),
+        title: "Delete all data?", body: h("p", {}, "This removes your squad and every game, from your account too. Export first if you might want it back."),
         okLabel: "Delete everything", danger: true, onOk: () => commit((st) => Object.assign(st, S.emptyState())),
       }) }, "Delete all data")]);
 }
@@ -887,7 +1195,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 window.addEventListener("storage", (e) => {
-  if (e.key !== storage.STORAGE_KEYS.DATA_KEY) return;
+  if (e.key !== storage.dataKey() || cloud) return; // with the cloud, Firestore keeps tabs in sync
   const fresh = storage.loadState();
   if (!fresh.problem) {
     app.state = fresh.state;
@@ -901,4 +1209,13 @@ storage.requestPersistence().then((ok) => {
 });
 
 app.route = parseRoute();
-render();
+if (cloud) {
+  cloud.onUser((user) => startAccount(user));
+  // Test hook (emulator only): sign in as any account.
+  if (cloud.isEmulator) window.__sideline = { signInAs: cloud.testSignIn };
+} else if (app.meta.lastUser && app.meta.allowed?.[app.meta.lastUser.uid]) {
+  startAccount(app.meta.lastUser);
+} else {
+  app.access = "no-cloud";
+  render();
+}

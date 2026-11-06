@@ -1,11 +1,17 @@
-import { test } from "@playwright/test";
+import { test, allow, signInAs } from "./fixtures.js";
+
+test.use({ signIn: false });
 
 // Seeds a mid-game state and saves screenshots to screenshots/ for review.
 for (const scheme of ["light", "dark"]) {
-  test(`screenshots (${scheme})`, async ({ page }) => {
+  test(`screenshots (${scheme})`, async ({ page, email }) => {
+    await allow(email);
+    const shot = (name, fullPage = false) => page.screenshot({ path: `screenshots/${scheme}-${name}.png`, fullPage });
     await page.setViewportSize({ width: 390, height: 844 });
     await page.emulateMedia({ colorScheme: scheme });
     await page.goto("./");
+    await page.locator("#sign-in").waitFor();
+    await shot("signin");
     await page.evaluate(() => {
       const names = ["Sam", "Alex", "Chris", "Pat", "Jamie", "Rory", "Jordan", "Lee", "Dan", "Finn", "Cian", "Oisin", "Liam", "Conor"];
       const nums = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16];
@@ -37,8 +43,8 @@ for (const scheme of ["light", "dark"]) {
       ];
       localStorage.setItem("sideline.data.v1", JSON.stringify({ nextId: 5000, players, games }));
     });
-    const shot = (name, fullPage = false) => page.screenshot({ path: `screenshots/${scheme}-${name}.png`, fullPage });
-    await page.reload(); // load the seeded data
+    await page.reload();
+    await signInAs(page, email); // first sign-in uploads the seeded data
     await page.goto("./#/game/50");
     // Mid-entry: place chosen and event chosen, waiting for the player.
     const pitch = page.locator("#pitch");
