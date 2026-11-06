@@ -1,7 +1,7 @@
 // Pure data logic: no DOM, no storage. Functions mutate the state they're given.
 
 export const FORMAT = "sideline-stats";
-export const VERSION = 2; // 2: per-game rosters and shirt numbers on events
+export const VERSION = 3; // 2: per-game rosters and shirt numbers on events; 3: lineups, subs, goals conceded
 
 /**
  * What can happen. Ids are stored in saved data, so never rename them; labels are free to change.
@@ -9,9 +9,11 @@ export const VERSION = 2; // 2: per-game rosters and shirt numbers on events
  */
 export const EVENT_TYPES = [
   { id: "tackle_won", label: "Tackle won", short: "Tkl", group: 0, shape: "circle", positive: true },
-  { id: "save", label: "Save", short: "Save", group: 0, shape: "diamond", positive: true },
+  { id: "broken_won", label: "Broken ball won", short: "BB W", group: 0, shape: "hexagon", positive: true },
+  { id: "broken_lost", label: "Broken ball lost", short: "BB L", group: 0, shape: "hexagon", positive: false },
   { id: "air_won", label: "Header won", short: "Hdr W", group: 1, shape: "triangle", positive: true },
   { id: "air_lost", label: "Header lost", short: "Hdr L", group: 1, shape: "triangle", positive: false },
+  { id: "save", label: "Save", short: "Save", group: 1, shape: "diamond", positive: true },
   { id: "shot_on", label: "Shot on target", short: "On T", group: 2, shape: "square", positive: true },
   { id: "shot_off", label: "Shot off target", short: "Off T", group: 2, shape: "square", positive: false },
   { id: "goal", label: "Goal", short: "Goal", group: 2, shape: "star", positive: true },
@@ -174,9 +176,14 @@ export function checkRoster(state, roster) {
   return { roster: out.sort((a, b) => a.number - b.number) };
 }
 
-export function setRoster(state, game, roster) {
+export function setRoster(state, game, roster, now = Date.now()) {
   const res = checkRoster(state, roster);
-  if (!res.error) game.roster = res.roster;
+  if (res.error) return res;
+  game.roster = res.roster;
+  // Anyone dropped from the sheet can't still be on the pitch.
+  const ids = new Set(res.roster.map((r) => r.playerId));
+  const keep = onPitch(game).filter((id) => ids.has(id));
+  if (keep.length !== onPitch(game).length && phase(game) !== "full") setOnPitch(state, game, keep, now);
   return res;
 }
 
@@ -193,6 +200,9 @@ export function createGame(state, { opponent, date, halfLength, roster }) {
     date: isValidISODate(date) ? date : todayISO(),
     halfLength: len,
     roster: sheet.roster,
+    starting: [], // on the pitch at kick-off
+    subs: [], // { id, half, t, on: [ids], off: [ids] }, t in clock seconds like events
+    conceded: [], // { id, half, t }
     periods: [],
     events: [],
   };
@@ -293,6 +303,93 @@ export function deleteEvent(game, id) {
   game.events = game.events.filter((e) => e.id !== id);
 }
 
+// ---------------------------------------------------------------- lineup, subs & playing time
+
+/** Who's on the pitch now: the starting lineup with every substitution applied. */
+export function onPitch(game) {
+  const on = new Set(game.starting);
+  for (const sub of sortedSubs(game)) {
+    sub.off.forEach((id) => on.delete(id));
+    sub.on.forEach((id) => on.add(id));
+  }
+  return [...on];
+}
+
+const sortedSubs = (game) => [...game.subs].sort((a, b) => a.half - b.half || a.t - b.t || a.id - b.id);
+
+/**
+ * Makes `ids` the players on the pitch. Before kick-off that sets the starting
+ * lineup; at half time it's a sub at the start of the 2nd half; otherwise a sub
+ * now. Returns the sub record (null if nothing changed or before kick-off).
+ */
+export function setOnPitch(state, game, ids, now = Date.now()) {
+  const p = phase(game);
+  if (p === "full") return null;
+  const want = new Set(ids);
+  if (p === "pre") {
+    game.starting = [...want];
+    return null;
+  }
+  const current = new Set(onPitch(game));
+  const on = [...want].filter((id) => !current.has(id));
+  const off = [...current].filter((id) => !want.has(id));
+  if (!on.length && !off.length) return null;
+  const c = clock(game, now);
+  const sub = p === "half"
+    ? { id: state.nextId++, half: 2, t: game.halfLength * 60, on, off }
+    : { id: state.nextId++, half: c.half, t: c.seconds, on, off };
+  game.subs.push(sub);
+  return sub;
+}
+
+export function deleteSub(game, id) {
+  game.subs = game.subs.filter((s) => s.id !== id);
+}
+
+/** Seconds each player has been on the pitch: Map(playerId → seconds). */
+export function playingTime(game, now = Date.now()) {
+  const secs = new Map();
+  const on = new Set(game.starting);
+  const subs = sortedSubs(game);
+  let i = 0;
+  for (const half of [1, 2]) {
+    const period = game.periods[half - 1];
+    // Half-time subs (half 2, at its first second) are applied as the 2nd half starts.
+    const start = (half - 1) * game.halfLength * 60;
+    if (!period) break;
+    const end = start + Math.max(0, Math.floor(((period.end ?? now) - period.start) / 1000));
+    let from = start;
+    const credit = (to) => { for (const id of on) secs.set(id, (secs.get(id) ?? 0) + Math.max(0, to - from)); };
+    while (i < subs.length && subs[i].half === half) {
+      const t = Math.min(Math.max(subs[i].t, start), end);
+      credit(t);
+      from = t;
+      subs[i].off.forEach((id) => on.delete(id));
+      subs[i].on.forEach((id) => on.add(id));
+      i++;
+    }
+    credit(end);
+  }
+  return secs;
+}
+
+export const formatMinutes = (seconds) => `${Math.floor((seconds ?? 0) / 60)}'`;
+
+// ---------------------------------------------------------------- score
+
+export function concede(state, game, now = Date.now()) {
+  const c = clock(game, now);
+  const goal = { id: state.nextId++, half: c.half, t: c.seconds };
+  game.conceded.push(goal);
+  return goal;
+}
+
+export function deleteConceded(game, id) {
+  game.conceded = game.conceded.filter((g) => g.id !== id);
+}
+
+export const score = (game) => ({ us: game.events.filter((e) => e.type === "goal").length, them: game.conceded.length });
+
 // ---------------------------------------------------------------- stats
 
 const zeroCounts = () => Object.fromEntries(EVENT_IDS.map((id) => [id, 0]));
@@ -312,6 +409,13 @@ export function tally(events) {
 
 export function seasonTally(state) {
   return tally(state.games.flatMap((g) => g.events));
+}
+
+/** Total seconds played per player across all games. */
+export function seasonPlayingTime(state, now = Date.now()) {
+  const total = new Map();
+  for (const g of state.games) for (const [id, s] of playingTime(g, now)) total.set(id, (total.get(id) ?? 0) + s);
+  return total;
 }
 
 const label = (number, name) => (number == null ? name || "?" : name ? `#${number} ${name}` : `#${number}`);
@@ -337,17 +441,26 @@ export function eventPlayerLabel(state, event) {
   return label(event.number, state.players.find((p) => p.id === event.playerId)?.name);
 }
 
-export const goalsFor = (game) => game.events.filter((e) => e.type === "goal").length;
 
 const csvCell = (v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
 
 export function gameCSV(state, game) {
   const rows = [["Minute", "Half", "Clock", "Event", "Number", "Player", "X (0 own goal-1 their goal)", "Y (0-1)"]];
-  const sorted = [...game.events].sort((a, b) => a.half - b.half || a.t - b.t);
-  for (const e of sorted) {
-    const p = state.players.find((p) => p.id === e.playerId);
-    rows.push([minuteLabel(e, game.halfLength), e.half, formatClock(e.t), eventType(e.type).label, e.number ?? "", e.playerId == null ? "Unknown" : p?.name ?? "", e.x, e.y]);
-  }
+  const name = (id) => state.players.find((p) => p.id === id)?.name ?? "";
+  const num = (id) => game.roster.find((r) => r.playerId === id)?.number ?? "";
+  const items = [
+    ...game.events.map((e) => ({ ...e, row: [eventType(e.type).label, e.number ?? "", e.playerId == null ? "Unknown" : name(e.playerId), e.x, e.y] })),
+    ...game.conceded.map((g) => ({ ...g, row: ["Goal conceded", "", "", "", ""] })),
+    ...game.subs.flatMap((sub) => [
+      ...sub.off.map((id) => ({ ...sub, row: ["Sub off", num(id), name(id), "", ""] })),
+      ...sub.on.map((id) => ({ ...sub, row: ["Sub on", num(id), name(id), "", ""] })),
+    ]),
+  ].sort((a, b) => a.half - b.half || a.t - b.t);
+  for (const it of items) rows.push([minuteLabel(it, game.halfLength), it.half, formatClock(it.t), ...it.row]);
+  const { us, them } = score(game);
+  const mins = playingTime(game);
+  rows.push([], ["Score", `${us}-${them}`], [], ["Number", "Player", "Minutes played"]);
+  for (const r of game.roster) rows.push([r.number, name(r.playerId), Math.floor((mins.get(r.playerId) ?? 0) / 60)]);
   return rows.map((r) => r.map(csvCell).join(",")).join("\n") + "\n";
 }
 
@@ -413,12 +526,28 @@ export function parseState(text) {
         e.number = checked.roster.find((r) => r.playerId === e.playerId)?.number ?? state.players.find((p) => p.id === e.playerId).number;
       }
     }
+    // Version 3 added lineups, subs and goals conceded; older games start with none.
+    const known = (list, what) => {
+      if (!Array.isArray(list ?? [])) throw new Error(`Game ${g.id} has an invalid ${what}.`);
+      for (const id of list ?? []) if (!playerIds.has(id)) throw new Error(`Game ${g.id} has an unknown player in its ${what}.`);
+      return [...new Set(list ?? [])];
+    };
+    const timed = (x, what) => {
+      useId(x?.id, what);
+      if (![1, 2].includes(x.half) || !Number.isFinite(x.t) || x.t < 0) throw new Error(`A ${what} in game ${g.id} has an invalid time.`);
+      return { id: x.id, half: x.half, t: Math.floor(x.t) };
+    };
+    const subs = (g.subs ?? []).map((x) => ({ ...timed(x, "substitution"), on: known(x.on, "substitution"), off: known(x.off, "substitution") }));
+    const conceded = (g.conceded ?? []).map((x) => timed(x, "goal conceded"));
     state.games.push({
       id: g.id,
       opponent: g.opponent.trim(),
       date: isValidISODate(g.date) ? g.date : todayISO(),
       halfLength: g.halfLength,
       roster: checked.roster,
+      starting: known(g.starting, "starting lineup"),
+      subs,
+      conceded,
       periods,
       events,
     });

@@ -124,7 +124,8 @@ test("CSV export lists events in match order with escaping", () => {
   S.addEvent(st, g, { type: "air_won", playerId: st.players[2].id, x: 0.25, y: 0.5 }, 90_000);
   S.addEvent(st, g, { type: "tackle_won", playerId: null, x: 0.1, y: 0.1 }, 30_000);
   const lines = S.gameCSV(st, g).trim().split("\n");
-  assert.equal(lines.length, 3);
+  assert.equal(lines[0].split(",")[0], "Minute");
+  assert.ok(lines.includes("Score,0-0"));
   assert.match(lines[1], /^1',1,00:30,Tackle won,,Unknown,/);
   assert.match(lines[2], /^2',1,01:30,Header won,5,"Kev ""The Wall"", Jr",0.25,0.5$/);
 });
@@ -183,7 +184,7 @@ test("each game has its own team sheet and numbers", () => {
   assert.equal(S.eventPlayerLabel(st, e), "#10 Jordan");
   assert.equal(S.gamePlayerLabel(st, g1, jordan.id), "#10 Jordan");
   assert.equal(S.playerLabel(st, jordan.id), "#9 Jordan"); // season view uses the usual number
-  assert.equal(S.goalsFor(g1), 1);
+  assert.equal(S.score(g1).us, 1);
 
   // Changing the sheet mid-game (Jordan switches to 11) doesn't rewrite the earlier goal.
   assert.ok(!S.setRoster(st, g1, [{ playerId: jordan.id, number: 11 }, { playerId: chris.id, number: 4 }]).error);
@@ -210,4 +211,103 @@ test("version 1 data (squad lists, no numbers on events) is upgraded on load", (
   assert.equal(st.games[0].events[0].number, 9);
   assert.equal(st.games[0].events[1].number, null);
   assert.equal(S.eventType("air_won").label, "Header won"); // old ids, new names
+});
+
+const MIN = 60_000;
+
+test("lineup and subs: who's on, and minutes played across halves", () => {
+  const st = S.emptyState();
+  const [a, b, c] = ["A", "B", "C"].map((n, i) => S.addPlayer(st, String(i + 1), n).player);
+  const g = S.createGame(st, { opponent: "R", halfLength: 30 }).game;
+  // Before kick-off, choosing players sets the starting lineup (no sub recorded).
+  assert.equal(S.setOnPitch(st, g, [a.id, b.id], 0), null);
+  assert.deepEqual(g.starting, [a.id, b.id]);
+
+  S.advancePhase(g, 0); // kick-off
+  // 10 minutes in: C on for B.
+  const sub = S.setOnPitch(st, g, [a.id, c.id], 10 * MIN);
+  assert.deepEqual({ on: sub.on, off: sub.off, half: sub.half, t: sub.t }, { on: [c.id], off: [b.id], half: 1, t: 600 });
+  assert.deepEqual(S.onPitch(g).sort(), [a.id, c.id].sort());
+  assert.equal(S.setOnPitch(st, g, [c.id, a.id], 11 * MIN), null); // no change, no sub
+
+  S.advancePhase(g, 30 * MIN); // half time after 30 minutes
+  // Half-time change: B back on for A, counted from the start of the 2nd half.
+  const ht = S.setOnPitch(st, g, [b.id, c.id], 40 * MIN);
+  assert.deepEqual({ half: ht.half, t: ht.t }, { half: 2, t: 1800 });
+  S.advancePhase(g, 45 * MIN); // 2nd half kicks off
+  S.advancePhase(g, 75 * MIN); // full time after 30 more minutes
+  assert.equal(S.setOnPitch(st, g, [a.id], 80 * MIN), null); // nothing after full time
+
+  const mins = S.playingTime(g, 999 * MIN);
+  assert.equal(mins.get(a.id), 30 * 60); // whole 1st half
+  assert.equal(mins.get(b.id), 10 * 60 + 30 * 60); // first 10, all of 2nd half
+  assert.equal(mins.get(c.id), 20 * 60 + 30 * 60); // last 20 of 1st half, all of 2nd
+  assert.equal(S.formatMinutes(mins.get(c.id)), "50'");
+
+  // Deleting a sub (e.g. Undo) rewinds who was on: C never came on, B played throughout.
+  S.deleteSub(g, sub.id);
+  const after = S.playingTime(g, 999 * MIN);
+  assert.equal(after.get(c.id) ?? 0, 0);
+  assert.equal(after.get(b.id), 60 * 60);
+});
+
+test("minutes run while a half is live", () => {
+  const st = S.emptyState();
+  const a = S.addPlayer(st, "1", "A").player;
+  const g = S.createGame(st, { opponent: "R", halfLength: 30 }).game;
+  S.setOnPitch(st, g, [a.id], 0);
+  S.advancePhase(g, 0);
+  assert.equal(S.playingTime(g, 7 * MIN + 30_000).get(a.id), 450);
+});
+
+test("dropping an on-pitch player from the team sheet subs them off", () => {
+  const st = S.emptyState();
+  const [a, b] = ["A", "B"].map((n, i) => S.addPlayer(st, String(i + 1), n).player);
+  const g = S.createGame(st, { opponent: "R", halfLength: 30 }).game;
+  S.setOnPitch(st, g, [a.id, b.id], 0);
+  S.advancePhase(g, 0);
+  S.setRoster(st, g, [{ playerId: a.id, number: 1 }], 5 * MIN);
+  assert.deepEqual(S.onPitch(g), [a.id]);
+  assert.equal(S.playingTime(g, 20 * MIN).get(b.id), 300);
+});
+
+test("score: our goals from Goal events, theirs from conceded", () => {
+  const st = S.emptyState();
+  const a = S.addPlayer(st, "9", "A").player;
+  const g = S.createGame(st, { opponent: "R", halfLength: 30 }).game;
+  S.advancePhase(g, 0);
+  S.addEvent(st, g, { type: "goal", playerId: a.id, x: 1, y: 0.5 }, MIN);
+  S.addEvent(st, g, { type: "goal", playerId: null, x: 1, y: 0.5 }, 2 * MIN);
+  const c = S.concede(st, g, 3 * MIN);
+  assert.deepEqual(S.score(g), { us: 2, them: 1 });
+  assert.equal(S.minuteLabel(c, 30), "4'");
+  S.deleteConceded(g, c.id);
+  assert.deepEqual(S.score(g), { us: 2, them: 0 });
+});
+
+test("broken ball events exist with stable ids", () => {
+  assert.equal(S.eventType("broken_won").label, "Broken ball won");
+  assert.equal(S.eventType("broken_lost").positive, false);
+  assert.equal(S.EVENT_TYPES.length, 9);
+});
+
+test("version 2 data gains empty lineups, subs and conceded; v3 round-trips", () => {
+  const st = S.emptyState();
+  const [a, b] = ["A", "B"].map((n, i) => S.addPlayer(st, String(i + 1), n).player);
+  const g = S.createGame(st, { opponent: "R", halfLength: 30 }).game;
+  const v2 = JSON.parse(JSON.stringify(S.toExport(st)));
+  v2.version = 2;
+  for (const game of v2.games) { delete game.starting; delete game.subs; delete game.conceded; }
+  const up = S.parseState(JSON.stringify(v2)).games[0];
+  assert.deepEqual([up.starting, up.subs, up.conceded], [[], [], []]);
+
+  S.setOnPitch(st, g, [a.id], 0);
+  S.advancePhase(g, 0);
+  S.setOnPitch(st, g, [b.id], MIN);
+  S.concede(st, g, 2 * MIN);
+  const back = S.parseState(JSON.stringify(S.toExport(st)));
+  assert.deepEqual(back.games[0], g);
+  const bad = JSON.parse(JSON.stringify(S.toExport(st)));
+  bad.games[0].subs[0].on = [999];
+  assert.throws(() => S.parseState(JSON.stringify(bad)), /unknown player in its substitution/);
 });

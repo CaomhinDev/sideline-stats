@@ -137,12 +137,12 @@ body.live main { padding-top: 6px; }
 .pitch-wrap { position: relative; margin: 0 0 8px; }
 .live-status {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  min-height: 36px; margin: 0 0 6px; padding: 0 4px 0 10px; border-radius: 10px;
+  min-height: 34px; margin: 0 0 6px; padding: 0 4px 0 10px; border-radius: 10px;
   background: var(--surface-2); font-size: 0.9rem; font-weight: 600;
 }
 .live-status .msg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .live-status .undo { appearance: none; border: 0; background: none; color: var(--selected); font: inherit; font-weight: 800; text-decoration: underline; padding: 8px 10px; cursor: pointer; flex: none; }
-.pitch { display: block; width: 100%; height: auto; max-height: 30vh; margin: 0 auto; border-radius: 10px; touch-action: manipulation; cursor: crosshair; }
+.pitch { display: block; width: 100%; height: auto; max-height: 27vh; margin: 0 auto; border-radius: 10px; touch-action: manipulation; cursor: crosshair; }
 .pitch .grass { fill: var(--grass); }
 .pitch .stripe { fill: var(--grass-2); }
 .pitch .line { fill: none; stroke: var(--pitch-line); stroke-width: 0.5; }
@@ -155,18 +155,14 @@ body.live main { padding-top: 6px; }
 .step h2 { margin: 0; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-2); }
 .step .done { color: var(--accent); }
 
-/* Defending and aerial on a row of four; shots and goal on a row of three. */
-.events { display: grid; grid-template-columns: repeat(12, 1fr); gap: 6px; margin-bottom: 8px; }
-.events .ev-btn { grid-column: span 3; }
-.events .ev-btn:nth-child(n+5) { grid-column: span 4; }
+/* 3×3: ground duels, then aerial + save, then shots + goal. */
+.events { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 8px; }
 .events .ev-btn[data-event="goal"] { font-size: 1.05rem; }
 .ev-btn, .pl-btn {
   appearance: none; font: inherit; color: var(--text); background: var(--surface);
   border: 2px solid var(--border); border-radius: 12px; cursor: pointer; touch-action: manipulation;
 }
-.ev-btn { display: flex; align-items: center; gap: 6px; padding: 6px 8px; min-height: 52px; font-weight: 700; font-size: 0.9rem; line-height: 1.12; text-align: left; }
-/* The four narrow buttons stack icon over label so words never split. */
-.events .ev-btn:nth-child(-n+4) { flex-direction: column; justify-content: center; gap: 3px; padding: 6px 2px; text-align: center; font-size: 0.82rem; }
+.ev-btn { display: flex; align-items: center; gap: 6px; padding: 4px 6px; min-height: 48px; font-weight: 700; font-size: 0.84rem; line-height: 1.1; text-align: left; }
 .clock-line { display: flex; align-items: baseline; gap: 8px; }
 .opp-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .opp-line .opp { min-width: 0; }
@@ -174,8 +170,9 @@ body.live main { padding-top: 6px; }
 .ev-btn svg { flex: none; }
 .ev-btn[aria-pressed="true"], .pl-btn[aria-pressed="true"] { border-color: var(--selected); background: var(--selected-soft); box-shadow: 0 0 0 2px var(--selected) inset; }
 .players { display: grid; grid-template-columns: repeat(auto-fill, minmax(62px, 1fr)); gap: 6px; margin-bottom: 10px; }
-.pl-btn { min-height: 52px; padding: 4px; display: grid; place-items: center; align-content: center; }
-.pl-btn .n { font-size: 1.35rem; font-weight: 800; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.pl-btn { min-height: 48px; padding: 4px; display: grid; place-items: center; align-content: center; }
+.pl-btn.bench { opacity: 0.45; border-style: dashed; }
+.pl-btn .n { font-size: 1.3rem; font-weight: 800; line-height: 1.1; font-variant-numeric: tabular-nums; }
 .pl-btn .nm { font-size: 0.72rem; color: var(--text-2); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ev-btn:active, .pl-btn:active { transform: scale(0.97); }
 
@@ -234,3 +231,17 @@ dialog .roster { max-height: 46vh; overflow-y: auto; padding-right: 2px; }
 .roster-row label { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; margin: 0; font-weight: 500; min-height: 40px; cursor: pointer; }
 .roster-row input[type="checkbox"] { width: 22px; height: 22px; flex: none; }
 input.roster-num { width: 64px; min-height: 40px; padding: 6px 8px; text-align: center; font-weight: 700; flex: none; }
+
+.score { font-weight: 800; font-variant-numeric: tabular-nums; padding: 1px 8px; border-radius: 8px; background: var(--text); color: var(--bg); flex: none; }
+.score.big { font-size: 1.2rem; vertical-align: middle; }
+.tools { display: grid; grid-template-columns: auto auto auto 1fr; gap: 6px; }
+.tools .btn { padding: 6px 10px; font-size: 0.85rem; }
+.tools #they-scored { justify-self: end; }
+
+/* Substitutions panel */
+.sub-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(76px, 1fr)); gap: 6px; min-height: 52px; padding: 6px; border-radius: 10px; background: var(--surface-2); margin-bottom: 8px; }
+.sub-chip { appearance: none; font: inherit; color: var(--text); background: var(--surface); border: 2px solid var(--border); border-radius: 10px; padding: 4px; min-height: 56px; display: grid; place-items: center; align-content: center; cursor: pointer; }
+.sub-chip .n { font-weight: 800; font-size: 1.15rem; line-height: 1.1; }
+.sub-chip .nm { font-size: 0.72rem; color: var(--text-2); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sub-chip .mins { font-size: 0.72rem; font-weight: 700; color: var(--text-2); }
+.sub-chip.changed { border-color: var(--selected); background: var(--selected-soft); }

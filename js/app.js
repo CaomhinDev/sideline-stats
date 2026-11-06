@@ -68,6 +68,7 @@ function symbolShape(type, cx, cy, r, extra = {}) {
     case "circle": return s("circle", { ...extra, class: cls, cx, cy, r: r * 0.95 });
     case "diamond": return poly([[0, -1.15], [1.05, 0], [0, 1.15], [-1.05, 0]]);
     case "triangle": return poly([[0, -1.1], [1.05, 0.75], [-1.05, 0.75]]);
+    case "hexagon": return poly(Array.from({ length: 6 }, (_, i) => [Math.cos((Math.PI / 3) * i) * 1.05, Math.sin((Math.PI / 3) * i) * 1.05]));
     case "star": return poly(Array.from({ length: 10 }, (_, i) => {
       const a = (Math.PI / 5) * i - Math.PI / 2;
       const rr = i % 2 ? 0.5 : 1.25;
@@ -269,7 +270,9 @@ function viewGames() {
     games.length
       ? h("ul", { class: "list", style: "margin-top:16px" }, games.map((g) => {
           const c = S.clock(g);
-          const status = c.running ? `${PHASE_LABEL[c.phase]} · ${S.formatClock(c.seconds)}` : PHASE_LABEL[c.phase];
+          const sc = S.score(g);
+          const showScore = c.phase !== "pre" || sc.us + sc.them > 0;
+          const status = `${showScore ? `${sc.us}–${sc.them} · ` : ""}${c.running ? `${PHASE_LABEL[c.phase]} ${S.formatClock(c.seconds)}` : PHASE_LABEL[c.phase]}`;
           return h("li", {},
             h("a", { class: "main", href: `#/game/${g.id}` },
               h("div", { class: "primary" }, `vs ${g.opponent}`),
@@ -278,7 +281,7 @@ function viewGames() {
             h("a", { class: "link-btn", href: `#/game/${g.id}/stats` }, "Stats"));
         }))
       : h("p", { class: "muted", style: "margin-top:16px" }, "No games yet."),
-    season.byPlayer.size > 0 && [h("h2", {}, "Season totals"), statsTable(season, { selectable: false })]);
+    season.byPlayer.size > 0 && [h("h2", {}, "Season totals"), statsTable(season, { selectable: false, minutes: S.seasonPlayingTime(st) })]);
 }
 
 // ---- New game
@@ -340,6 +343,9 @@ function viewLive(game) {
   const next = S.NEXT_ACTION[c.phase];
   const players = matchdayPlayers(game);
   const recent = [...game.events].sort((a, b) => b.id - a.id).slice(0, 5);
+  // Once a lineup is set, bench players are dimmed (still tappable).
+  const on = new Set(S.onPitch(game));
+  const benchDim = on.size > 0;
 
   const pitch = pitchSvg({
     marks: [],
@@ -353,7 +359,8 @@ function viewLive(game) {
       h("a", { class: "back", href: "#/games", "aria-label": "Back to games" }, "‹"),
       h("div", { class: "title" },
         // A long opponent name truncates; the goal count never does.
-        h("div", { class: "opp-line" }, h("span", { class: "opp" }, `vs ${game.opponent}`), h("span", { class: "badge", id: "goals" }, `Goals ${S.goalsFor(game)}`)),
+        h("div", { class: "opp-line" }, h("span", { class: "opp" }, `vs ${game.opponent}`),
+          h("span", { class: "score", id: "score", "aria-label": `Score: us ${S.score(game).us}, them ${S.score(game).them}` }, `${S.score(game).us}–${S.score(game).them}`)),
         h("div", { class: "clock-line" }, h("span", { class: "clock", id: "clock" }, S.formatClock(c.seconds)),
           h("span", { class: "phase-label", id: "phase-label" }, PHASE_LABEL[c.phase]))),
       next
@@ -368,7 +375,7 @@ function viewLive(game) {
       }, symbolIcon(t.id, 18), h("span", {}, t.label)))),
     h("div", { class: "players", role: "group", "aria-label": "Player" },
       players.map((p) => h("button", {
-        type: "button", class: "pl-btn", "aria-pressed": String(pend.playerId === p.id), "data-number": p.number,
+        type: "button", class: `pl-btn${benchDim && !on.has(p.id) ? " bench" : ""}`, "aria-pressed": String(pend.playerId === p.id), "data-number": p.number,
         "aria-label": `#${p.number} ${p.name}`,
         onclick: () => { pend.playerId = pend.playerId === p.id ? undefined : p.id; afterPick(game); },
       }, h("span", { class: "n" }, p.number), p.name && h("span", { class: "nm" }, p.name))),
@@ -376,10 +383,15 @@ function viewLive(game) {
         type: "button", class: "pl-btn", "aria-pressed": String(pend.playerId === null), "data-number": "unknown", "aria-label": "Unknown player",
         onclick: () => { pend.playerId = pend.playerId === null ? undefined : null; afterPick(game); },
       }, h("span", { class: "n" }, "?"), h("span", { class: "nm" }, "Unknown"))),
-    h("div", { class: "row", style: "justify-content:space-between" },
+    h("div", { class: "tools" },
       h("button", { type: "button", class: "btn btn-quiet btn-small", disabled: !(pend.x != null || pend.type || pend.playerId !== undefined),
-        onclick: () => { app.pending = { gameId: game.id }; render(); } }, "Clear selection"),
-      h("button", { type: "button", class: "btn btn-quiet btn-small", onclick: () => editMatchday(game) }, "Edit players")),
+        onclick: () => { app.pending = { gameId: game.id }; render(); } }, "Clear"),
+      h("button", { type: "button", class: "btn btn-quiet btn-small", id: "subs-btn", disabled: c.phase === "full" || !game.roster.length, onclick: () => subsDialog(game) }, "Subs"),
+      h("button", { type: "button", class: "btn btn-quiet btn-small", onclick: () => editMatchday(game) }, "Players"),
+      h("button", { type: "button", class: "btn btn-quiet btn-small", id: "they-scored", onclick: () => {
+        const goal = commit(() => S.concede(app.state, game));
+        toast(`${S.minuteLabel(goal, game.halfLength)} Goal conceded`, () => commit(() => S.deleteConceded(game, goal.id)));
+      } }, "They scored")),
     h("div", { class: "recent" },
       h("div", { class: "step" }, h("h2", {}, "Latest"), h("a", { class: "link-btn small", href: `#/game/${game.id}/stats`, id: "to-stats" }, `All ${game.events.length} · stats →`)),
       recent.length
@@ -418,8 +430,13 @@ function eventRow(game, e) {
     }, "Delete"));
 }
 
-function phaseAction(game) {
+function phaseAction(game, { lineupDone = false } = {}) {
   const p = S.phase(game);
+  // Ask who's starting once; kicking off with nobody picked simply skips playing time.
+  if (p === "pre" && !lineupDone && game.roster.length && !game.starting.length) {
+    subsDialog(game, { kickOff: () => phaseAction(game, { lineupDone: true }) });
+    return;
+  }
   const doIt = () => {
     commit(() => S.advancePhase(game));
     const label = PHASE_LABEL[S.phase(game)];
@@ -436,6 +453,54 @@ function phaseAction(game) {
   } else {
     doIt();
   }
+}
+
+/**
+ * Who's on the pitch. Tap a player to move them between pitch and bench; the
+ * change is recorded at the clock time when Done is pressed. Before kick-off
+ * this sets the starting lineup.
+ */
+function subsDialog(game, { kickOff } = {}) {
+  const players = matchdayPlayers(game);
+  const mins = S.playingTime(game);
+  const before = new Set(S.onPitch(game));
+  const on = new Set(before);
+  const body = h("div", {});
+  const chip = (p) => h("button", {
+    type: "button", class: `sub-chip${on.has(p.id) !== before.has(p.id) ? " changed" : ""}`, "data-number": p.number,
+    "aria-label": `#${p.number} ${p.name}, ${on.has(p.id) ? "on the pitch" : "on the bench"}`,
+    onclick: () => { on.has(p.id) ? on.delete(p.id) : on.add(p.id); draw(); },
+  }, h("span", { class: "n" }, p.number), h("span", { class: "nm" }, p.name), S.phase(game) !== "pre" && h("span", { class: "mins" }, S.formatMinutes(mins.get(p.id))));
+  const draw = () => {
+    const pitch = players.filter((p) => on.has(p.id));
+    const bench = players.filter((p) => !on.has(p.id));
+    const goingOn = [...on].filter((id) => !before.has(id)).length;
+    const goingOff = [...before].filter((id) => !on.has(id)).length;
+    body.replaceChildren(
+      h("p", { class: "muted small" }, kickOff ? "Tap players to move them between bench and pitch." : "Tap who's coming off and who's going on, then Done. Minutes are recorded at that moment."),
+      h("div", { class: "step" }, h("h2", {}, `On the pitch (${pitch.length})`)),
+      h("div", { class: "sub-grid", id: "sub-on" }, pitch.map(chip)),
+      h("div", { class: "step" }, h("h2", {}, `Bench (${bench.length})`),
+        kickOff && h("button", { type: "button", class: "link-btn small", onclick: () => { players.forEach((p) => on.add(p.id)); draw(); } }, "Everyone on")),
+      h("div", { class: "sub-grid", id: "sub-bench" }, bench.map(chip)),
+      !kickOff && (goingOn || goingOff) ? h("p", { class: "small", style: "margin-top:8px" }, `${goingOff} off, ${goingOn} on`) : null);
+  };
+  draw();
+  openDialog({
+    title: kickOff ? "Who's starting?" : "Substitutions",
+    body,
+    okLabel: kickOff ? "Kick off" : "Done",
+    onOk: () => {
+      const sub = commit(() => S.setOnPitch(app.state, game, [...on]));
+      if (kickOff) {
+        kickOff();
+      } else if (sub) {
+        const names = (ids) => ids.map((id) => `#${game.roster.find((r) => r.playerId === id)?.number}`).join(", ");
+        toast(`Sub ${S.minuteLabel(sub, game.halfLength)}${sub.on.length ? ` · on ${names(sub.on)}` : ""}${sub.off.length ? ` · off ${names(sub.off)}` : ""}`,
+          () => commit(() => S.deleteSub(game, sub.id)));
+      }
+    },
+  });
 }
 
 function editMatchday(game) {
@@ -564,7 +629,7 @@ function viewStats(game) {
     h("div", { class: "step", style: "margin:4px 0 12px" },
       h("a", { class: "link-btn", href: `#/game/${game.id}` }, "‹ Back to game"),
       h("span", { class: "badge" }, PHASE_LABEL[c.phase])),
-    h("h1", { style: "margin-bottom:4px" }, `vs ${game.opponent}`),
+    h("h1", { style: "margin-bottom:4px" }, `vs ${game.opponent}`, " ", h("span", { class: "score big", id: "stats-score" }, `${S.score(game).us}–${S.score(game).them}`)),
     h("p", { class: "muted" }, fmtDate(game.date)),
     h("div", { class: "chips", role: "group", "aria-label": "Half" },
       [["Both halves", 0], ["1st half", 1], ["2nd half", 2]].map(([label, v]) =>
@@ -583,9 +648,20 @@ function viewStats(game) {
     pitchSvg({ marks: shown, label: `Pitch map of ${plural(shown.length, "event")}. Your team attacks to the right.` }),
     h("p", { class: "muted small", style: "margin-top:6px" }, "Attacking →. Filled = won / on target, hollow = lost / off target."),
     h("h2", {}, "By player"),
-    t.byPlayer.size
-      ? [h("p", { class: "muted small" }, "Tap a player to show only their events on the map."), statsTable(t, { selectable: true, game })]
+    t.byPlayer.size || game.starting.length
+      ? [h("p", { class: "muted small" }, "Tap a player to show only their events on the map. Mins = minutes on the pitch."), statsTable(t, { selectable: true, game, minutes: S.playingTime(game) })]
       : h("p", { class: "muted" }, "No events yet."),
+    (game.subs.length > 0 || game.conceded.length > 0) && h("details", { style: "margin-top:20px" },
+      h("summary", { style: "font-weight:700;cursor:pointer;font-size:1.15rem" }, "Subs and goals conceded"),
+      h("ul", { class: "list", style: "margin-top:8px", id: "subs-list" }, [
+        ...game.subs.map((x) => ({ x, kind: "sub" })), ...game.conceded.map((x) => ({ x, kind: "conceded" })),
+      ].sort((a, b) => a.x.half - b.x.half || a.x.t - b.x.t).map(({ x, kind }) => h("li", {},
+        h("span", { class: "muted small", style: "width:52px;flex:none" }, S.minuteLabel(x, game.halfLength)),
+        h("div", { class: "main" }, kind === "conceded"
+          ? h("div", { class: "primary" }, "Goal conceded")
+          : [h("div", { class: "primary" }, "Substitution"),
+             h("div", { class: "secondary" }, [x.on.length && `On: ${x.on.map((id) => S.gamePlayerLabel(app.state, game, id)).join(", ")}`, x.off.length && `Off: ${x.off.map((id) => S.gamePlayerLabel(app.state, game, id)).join(", ")}`].filter(Boolean).join(" · "))]),
+        h("button", { type: "button", class: "link-btn", onclick: () => commit(() => (kind === "sub" ? S.deleteSub(game, x.id) : S.deleteConceded(game, x.id))) }, "Delete"))))),
     game.events.length > 0 && h("details", { style: "margin-top:20px" },
       h("summary", { style: "font-weight:700;cursor:pointer;font-size:1.15rem" }, `All events (${game.events.length})`),
       h("ul", { class: "list", style: "margin-top:8px" }, [...game.events].sort((a, b) => b.half - a.half || b.t - a.t).map((e) => eventRow(game, e)))),
@@ -600,27 +676,28 @@ function viewStats(game) {
 }
 
 /** With a game, players are labelled and sorted by the number they wore in it. */
-function statsTable(t, { selectable, game }) {
+function statsTable(t, { selectable, game, minutes = new Map() }) {
   const labelFor = (k) => (game ? S.gamePlayerLabel(app.state, game, k) : S.playerLabel(app.state, k));
   const numberFor = (k) => game?.roster.find((r) => r.playerId === k)?.number ?? app.state.players.find((p) => p.id === k)?.number ?? 0;
   const f = app.statsFilter;
-  const keys = [...t.byPlayer.keys()].sort((a, b) => {
+  // Everyone who played or did something, even if one without the other.
+  const keys = [...new Set([...t.byPlayer.keys(), ...[...minutes].filter(([, s]) => s > 0).map(([id]) => id)])].sort((a, b) => {
     if (a === "unknown") return 1;
     if (b === "unknown") return -1;
     return numberFor(a) - numberFor(b);
   });
   const sum = (counts) => S.EVENT_IDS.reduce((n, id) => n + counts[id], 0);
   return h("div", { class: "table-wrap" }, h("table", {},
-    h("thead", {}, h("tr", {}, h("th", {}, "Player"), S.EVENT_TYPES.map((et) => h("th", { class: "num", title: et.label }, et.short)), h("th", { class: "num" }, "All"))),
+    h("thead", {}, h("tr", {}, h("th", {}, "Player"), h("th", { class: "num" }, "Mins"), S.EVENT_TYPES.map((et) => h("th", { class: "num", title: et.label }, et.short)), h("th", { class: "num" }, "All"))),
     h("tbody", {}, keys.map((k) => {
-      const counts = t.byPlayer.get(k);
+      const counts = t.byPlayer.get(k) ?? Object.fromEntries(S.EVENT_IDS.map((id) => [id, 0]));
       return h("tr", {
         class: selectable ? "clickable" : null,
         "aria-selected": selectable ? String(f.playerId === k) : null,
         onclick: selectable ? () => { f.playerId = f.playerId === k ? undefined : k; render(); } : null,
-      }, h("td", {}, labelFor(k)), S.EVENT_IDS.map((id) => h("td", { class: "num" }, counts[id] || "·")), h("td", { class: "num" }, sum(counts)));
+      }, h("td", {}, labelFor(k)), h("td", { class: "num" }, k === "unknown" ? "" : S.formatMinutes(minutes.get(k))), S.EVENT_IDS.map((id) => h("td", { class: "num" }, counts[id] || "·")), h("td", { class: "num" }, sum(counts)));
     })),
-    h("tfoot", {}, h("tr", {}, h("td", {}, "Team"), S.EVENT_IDS.map((id) => h("td", { class: "num" }, t.total[id])), h("td", { class: "num" }, sum(t.total))))));
+    h("tfoot", {}, h("tr", {}, h("td", {}, "Team"), h("td", {}), S.EVENT_IDS.map((id) => h("td", { class: "num" }, t.total[id])), h("td", { class: "num" }, sum(t.total))))));
 }
 
 function editGame(game) {

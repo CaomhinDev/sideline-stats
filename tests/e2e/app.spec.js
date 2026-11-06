@@ -31,6 +31,15 @@ async function tapPitch(page, fx, fy) {
   await pitch.click({ position: { x: ((1 + fx * 105) / 107) * box.width, y: ((1 + fy * 68) / 70) * box.height } });
 }
 
+/** Start game: the lineup prompt appears first; pick "Everyone on" unless told otherwise. */
+async function kickOff(page, { everyone = true } = {}) {
+  await page.locator("#phase-btn").click();
+  await expect(page.locator("#dialog-title")).toHaveText("Who's starting?");
+  if (everyone) await page.getByRole("button", { name: "Everyone on" }).click();
+  await page.locator("#dialog-ok").click();
+  await expect(page.locator("#phase-label")).toHaveText("1st half");
+}
+
 const ev = (page, id) => page.locator(`[data-event="${id}"]`);
 const pl = (page, n) => page.locator(`.pl-btn[data-number="${n}"]`);
 
@@ -101,7 +110,7 @@ test("live: three taps in any order record an event, with undo", async ({ page }
   await ev(page, "air_won").click();
   await expect(ev(page, "air_won")).toHaveAttribute("aria-pressed", "false");
   await pl(page, 7).click();
-  await page.getByRole("button", { name: "Clear selection" }).click();
+  await page.getByRole("button", { name: "Clear", exact: true }).click();
   await expect(pl(page, 7)).toHaveAttribute("aria-pressed", "false");
 
   // Survives a reload.
@@ -124,10 +133,10 @@ test("team sheet: per-game numbers, who's playing, and a late addition", async (
   await pl(page, 14).click();
   await tapPitch(page, 0.95, 0.5);
   await expect(page.locator("#live-status")).toContainText("GOAL! 1' #14 Jordan · Goal");
-  await expect(page.locator("#goals")).toHaveText("Goals 1");
+  await expect(page.locator("#score")).toHaveText("1–0");
 
   // Mid-game: Jordan switches to 9, a new player (#22 Kim) arrives.
-  await page.getByRole("button", { name: "Edit players" }).click();
+  await page.getByRole("button", { name: "Players", exact: true }).click();
   await page.getByLabel("Shirt number for Jordan").fill("9");
   await page.locator("#new-num").fill("22");
   await page.locator("#new-name").fill("Kim");
@@ -138,7 +147,7 @@ test("team sheet: per-game numbers, who's playing, and a late addition", async (
   await expect(page.locator("#recent li").first()).toContainText("#14 Jordan");
 
   // Clashing numbers are refused.
-  await page.getByRole("button", { name: "Edit players" }).click();
+  await page.getByRole("button", { name: "Players", exact: true }).click();
   await page.getByLabel("Shirt number for Kim").fill("7");
   await page.locator("#dialog-ok").click();
   await expect(page.locator("#dialog-error")).toContainText("both have #7");
@@ -162,6 +171,80 @@ test("data saved by the first version still loads", async ({ page }) => {
   await expect(page.locator("#recent li")).toContainText("#7 Sam");
 });
 
+test("lineup, substitutions and minutes played", async ({ page }) => {
+  await page.clock.install({ time: new Date("2026-11-07T10:00:00") });
+  await page.clock.pauseAt(new Date("2026-11-07T10:00:01"));
+  await addSquad(page, "1 Sam\n2 Alex\n3 Chris\n12 Sub");
+  await newGame(page, "Rovers", "30");
+
+  // Kick-off asks who's starting: everyone but #12.
+  await page.locator("#phase-btn").click();
+  await expect(page.locator("#dialog-title")).toHaveText("Who's starting?");
+  for (const n of [1, 2, 3]) await page.locator(`#sub-bench .sub-chip[data-number="${n}"]`).click();
+  await expect(page.locator("#sub-on .sub-chip")).toHaveCount(3);
+  await page.locator("#dialog-ok").click();
+  await expect(page.locator("#phase-label")).toHaveText("1st half");
+  await expect(page.locator('.pl-btn[data-number="12"]')).toHaveClass(/bench/);
+  await expect(page.locator('.pl-btn[data-number="2"]')).not.toHaveClass(/bench/);
+
+  // 20:00 in, #12 on for #2.
+  await page.clock.fastForward("20:00");
+  await page.locator("#subs-btn").click();
+  await expect(page.locator('#sub-on .sub-chip[data-number="2"] .mins')).toHaveText("20'");
+  await page.locator('#sub-on .sub-chip[data-number="2"]').click();
+  await page.locator('#sub-bench .sub-chip[data-number="12"]').click();
+  await expect(page.locator("#dialog")).toContainText("1 off, 1 on");
+  await page.locator("#dialog-ok").click();
+  await expect(page.locator("#live-status")).toContainText("Sub 21' · on #12 · off #2");
+  await expect(page.locator('.pl-btn[data-number="2"]')).toHaveClass(/bench/);
+
+  // Half time at 30:00; second half full 30 minutes.
+  await page.clock.fastForward("10:00");
+  await page.locator("#phase-btn").click();
+  await page.locator("#dialog-ok").click();
+  await page.locator("#phase-btn").click();
+  await page.clock.fastForward("30:00");
+  await page.locator("#phase-btn").click();
+  await page.locator("#dialog-ok").click();
+
+  await page.locator("#to-stats").click();
+  const mins = (n) => page.locator("tbody tr", { hasText: `#${n} ` }).locator("td").nth(1);
+  await expect(mins(1)).toHaveText("60'");
+  await expect(mins(2)).toHaveText("20'");
+  await expect(mins(12)).toHaveText("40'");
+  await page.getByText("Subs and goals conceded").click();
+  await expect(page.locator("#subs-list")).toContainText("On: #12 Sub · Off: #2 Alex");
+});
+
+test("score: our goals and theirs, with undo", async ({ page }) => {
+  await addSquad(page);
+  await newGame(page);
+  await expect(page.locator("#score")).toHaveText("0–0");
+  await ev(page, "goal").click();
+  await pl(page, 9).click();
+  await tapPitch(page, 0.95, 0.5);
+  await expect(page.locator("#score")).toHaveText("1–0");
+  await page.locator("#they-scored").click();
+  await expect(page.locator("#score")).toHaveText("1–1");
+  await expect(page.locator("#live-status")).toContainText("Goal conceded");
+  await page.locator("#they-scored").click();
+  await page.locator("#live-status .undo").click();
+  await expect(page.locator("#score")).toHaveText("1–1");
+  await page.goto("./#/games");
+  await expect(page.locator(".list .badge").first()).toContainText("1–1");
+});
+
+test("broken ball won and lost are logged like other events", async ({ page }) => {
+  await addSquad(page);
+  await newGame(page);
+  for (const [type, label] of [["broken_won", "Broken ball won"], ["broken_lost", "Broken ball lost"]]) {
+    await ev(page, type).click();
+    await pl(page, 4).click();
+    await tapPitch(page, 0.5, 0.5);
+    await expect(page.locator("#recent li").first()).toContainText(label);
+  }
+});
+
 test("clock: start, half time, second half from half length, full time; survives reload", async ({ page }) => {
   // Freeze time so only runFor() moves the clock.
   await page.clock.install({ time: new Date("2026-11-07T10:00:00") });
@@ -170,10 +253,10 @@ test("clock: start, half time, second half from half length, full time; survives
   await newGame(page, "City", "25");
   await expect(page.locator("#clock")).toHaveText("00:00");
   await expect(page.locator("#phase-btn")).toHaveText("Start game");
-  await page.locator("#phase-btn").click();
+  await kickOff(page);
   await expect(page.locator("#phase-label")).toHaveText("1st half");
 
-  await page.clock.runFor("12:34");
+  await page.clock.fastForward("12:34");
   await expect(page.locator("#clock")).toHaveText("12:34");
 
   // An event logged now is stamped 13'.
@@ -183,23 +266,23 @@ test("clock: start, half time, second half from half length, full time; survives
   await expect(page.locator("#recent li").first()).toContainText("13'");
 
   // Phone locked / page reloaded: the clock catches up from timestamps.
-  await page.clock.runFor("10:00");
+  await page.clock.fastForward("10:00");
   await page.reload();
   await expect(page.locator("#clock")).toHaveText("22:34");
 
   // Half time asks first, then stops the clock.
-  await page.clock.runFor("04:00");
+  await page.clock.fastForward("04:00");
   await page.locator("#phase-btn").click();
   await expect(page.locator("#dialog")).toContainText("Stop the clock at 26:34");
   await page.locator("#dialog-ok").click();
   await expect(page.locator("#phase-label")).toHaveText("Half time");
-  await page.clock.runFor("08:00");
+  await page.clock.fastForward("08:00");
   await expect(page.locator("#clock")).toHaveText("26:34");
 
   await page.locator("#phase-btn").click(); // Start 2nd half: no confirmation needed
   await expect(page.locator("#phase-label")).toHaveText("2nd half");
   await expect(page.locator("#clock")).toHaveText("25:00");
-  await page.clock.runFor("01:05");
+  await page.clock.fastForward("01:05");
   await expect(page.locator("#clock")).toHaveText("26:05");
   await ev(page, "shot_off").click();
   await pl(page, 10).click();
@@ -241,8 +324,9 @@ test("stats: totals, per-player table, map filters and CSV", async ({ page }) =>
   const [dl] = await Promise.all([page.waitForEvent("download"), page.getByRole("button", { name: "Download CSV" }).click()]);
   expect(dl.suggestedFilename()).toMatch(/-vs-Rovers\.csv$/);
   const csv = fs.readFileSync(await dl.path(), "utf8").trim().split("\n");
-  expect(csv).toHaveLength(6);
+  expect(csv.slice(0, csv.indexOf(""))).toHaveLength(6); // header + 5 events, then score and minutes
   expect(csv[1]).toContain("Tackle won,4,Chris");
+  expect(csv).toContain("Score,0-0");
 
   // Season totals appear on the games list.
   await page.goto("./#/games");
@@ -278,7 +362,7 @@ test("export and import restore everything after storage is cleared", async ({ p
 test("backup reminder appears after a finished game, not during one", async ({ page }) => {
   await addSquad(page);
   await newGame(page);
-  await page.locator("#phase-btn").click();
+  await kickOff(page);
   await page.goto("./#/games");
   await expect(page.locator("#banner")).toBeHidden();
   await page.locator(".list a.main").first().click();
