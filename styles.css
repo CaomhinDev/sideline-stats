@@ -155,15 +155,22 @@ body.live main { padding-top: 6px; }
 .step h2 { margin: 0; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-2); }
 .step .done { color: var(--accent); }
 
-/* Duels and aerials on one row of three, shots on a row of two. */
-.events { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; margin-bottom: 8px; }
-.events .ev-btn { grid-column: span 2; }
-.events .ev-btn:nth-child(n+4) { grid-column: span 3; }
+/* Defending and aerial on a row of four; shots and goal on a row of three. */
+.events { display: grid; grid-template-columns: repeat(12, 1fr); gap: 6px; margin-bottom: 8px; }
+.events .ev-btn { grid-column: span 3; }
+.events .ev-btn:nth-child(n+5) { grid-column: span 4; }
+.events .ev-btn[data-event="goal"] { font-size: 1.05rem; }
 .ev-btn, .pl-btn {
   appearance: none; font: inherit; color: var(--text); background: var(--surface);
   border: 2px solid var(--border); border-radius: 12px; cursor: pointer; touch-action: manipulation;
 }
-.ev-btn { display: flex; align-items: center; gap: 6px; padding: 6px 8px; min-height: 52px; font-weight: 700; font-size: 0.92rem; line-height: 1.15; text-align: left; }
+.ev-btn { display: flex; align-items: center; gap: 6px; padding: 6px 8px; min-height: 52px; font-weight: 700; font-size: 0.9rem; line-height: 1.12; text-align: left; }
+/* The four narrow buttons stack icon over label so words never split. */
+.events .ev-btn:nth-child(-n+4) { flex-direction: column; justify-content: center; gap: 3px; padding: 6px 2px; text-align: center; font-size: 0.82rem; }
+.clock-line { display: flex; align-items: baseline; gap: 8px; }
+.opp-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.opp-line .opp { min-width: 0; }
+.opp-line .badge { flex: none; }
 .ev-btn svg { flex: none; }
 .ev-btn[aria-pressed="true"], .pl-btn[aria-pressed="true"] { border-color: var(--selected); background: var(--selected-soft); box-shadow: 0 0 0 2px var(--selected) inset; }
 .players { display: grid; grid-template-columns: repeat(auto-fill, minmax(62px, 1fr)); gap: 6px; margin-bottom: 10px; }
@@ -195,7 +202,7 @@ body.live .toast { bottom: calc(12px + env(safe-area-inset-bottom)); }
 .toast button { appearance: none; border: 0; background: transparent; color: inherit; font: inherit; font-weight: 800; text-decoration: underline; padding: 8px 10px; cursor: pointer; }
 
 /* ---------------- Stats ---------------- */
-.totals { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-bottom: 12px; }
+.totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(76px, 1fr)); gap: 6px; margin-bottom: 12px; }
 .totals div { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 4px; text-align: center; }
 .totals .v { font-size: 1.4rem; font-weight: 800; font-variant-numeric: tabular-nums; }
 .totals .k { font-size: 0.72rem; white-space: nowrap; color: var(--text-2); display: flex; align-items: center; justify-content: center; gap: 4px; }
@@ -218,3 +225,12 @@ dialog::backdrop { background: rgb(0 0 0 / 0.45); }
 dialog h2 { font-size: 1.2rem; margin: 0 0 12px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* Team-sheet editor */
+.roster { display: grid; gap: 4px; }
+/* In the in-game pop-up the list scrolls so Save stays reachable. */
+dialog .roster { max-height: 46vh; overflow-y: auto; padding-right: 2px; }
+.roster-row { display: flex; align-items: center; gap: 8px; padding: 4px 4px 4px 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.roster-row label { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; margin: 0; font-weight: 500; min-height: 40px; cursor: pointer; }
+.roster-row input[type="checkbox"] { width: 22px; height: 22px; flex: none; }
+input.roster-num { width: 64px; min-height: 40px; padding: 6px 8px; text-align: center; font-weight: 700; flex: none; }

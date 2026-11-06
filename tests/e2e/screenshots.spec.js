@@ -10,14 +10,14 @@ for (const scheme of ["light", "dark"]) {
       const names = ["Sam", "Alex", "Chris", "Pat", "Jamie", "Rory", "Jordan", "Lee", "Dan", "Finn", "Cian", "Oisin", "Liam", "Conor"];
       const nums = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16];
       const players = names.map((name, i) => ({ id: i + 1, number: nums[i], name }));
-      const types = ["tackle_won", "air_won", "air_lost", "shot_on", "shot_off"];
+      const types = ["tackle_won", "save", "air_won", "air_lost", "shot_on", "shot_off", "goal"];
       let seed = 7;
       const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
       const events = [];
       let id = 100;
       for (let i = 0; i < 46; i++) {
-        const type = types[Math.floor(rnd() * 5)];
-        const shot = type.startsWith("shot");
+        const type = types[Math.floor(rnd() * 7)];
+        const shot = type.startsWith("shot") || type === "goal";
         const half = i < 26 ? 1 : 2;
         events.push({
           id: id++, type, playerId: Math.floor(rnd() * 14) + 1,
@@ -51,5 +51,10 @@ for (const scheme of ["light", "dark"]) {
     await shot("games", true);
     await page.goto("./#/squad");
     await shot("squad");
+    await page.goto("./#/new");
+    await page.locator("#opponent").fill("Harbour United");
+    await page.getByLabel("Shirt number for Jordan").fill("12");
+    await page.locator('.roster-row[data-player="Lee"] input[type=checkbox]').uncheck();
+    await shot("new-game");
   });
 }

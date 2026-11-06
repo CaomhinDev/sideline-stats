@@ -59,16 +59,22 @@ function setProps(el, props = {}) {
   }
 }
 
-/** Event symbol: colour = group, shape = group (circle/triangle/square), hollow = negative outcome. */
+/** Event symbol: colour = group (defending/aerial/attacking), shape = type, hollow = lost / off target. */
 function symbolShape(type, cx, cy, r, extra = {}) {
   const t = S.eventType(type);
   const cls = `sym-${t.group}${t.positive ? "" : " sym-hollow"} ${extra.class ?? ""}`.trim();
-  if (t.group === 0) return s("circle", { ...extra, class: cls, cx, cy, r: r * 0.95 });
-  if (t.group === 1) {
-    const pts = [[cx, cy - r * 1.1], [cx + r * 1.05, cy + r * 0.75], [cx - r * 1.05, cy + r * 0.75]];
-    return s("polygon", { ...extra, class: cls, points: pts.map((p) => p.join(",")).join(" "), "stroke-linejoin": "round" });
+  const poly = (pts) => s("polygon", { ...extra, class: cls, points: pts.map(([x, y]) => `${cx + x * r},${cy + y * r}`).join(" "), "stroke-linejoin": "round" });
+  switch (t.shape) {
+    case "circle": return s("circle", { ...extra, class: cls, cx, cy, r: r * 0.95 });
+    case "diamond": return poly([[0, -1.15], [1.05, 0], [0, 1.15], [-1.05, 0]]);
+    case "triangle": return poly([[0, -1.1], [1.05, 0.75], [-1.05, 0.75]]);
+    case "star": return poly(Array.from({ length: 10 }, (_, i) => {
+      const a = (Math.PI / 5) * i - Math.PI / 2;
+      const rr = i % 2 ? 0.5 : 1.25;
+      return [Math.cos(a) * rr, Math.sin(a) * rr + 0.1];
+    }));
+    default: return s("rect", { ...extra, class: cls, x: cx - r * 0.85, y: cy - r * 0.85, width: r * 1.7, height: r * 1.7, rx: r * 0.2 });
   }
-  return s("rect", { ...extra, class: cls, x: cx - r * 0.85, y: cy - r * 0.85, width: r * 1.7, height: r * 1.7, rx: r * 0.2 });
 }
 const symbolIcon = (type, size = 18) =>
   s("svg", { width: size, height: size, viewBox: "0 0 20 20", "aria-hidden": "true" }, symbolShape(type, 10, 10.5, 7.2));
@@ -283,7 +289,7 @@ function viewNewGame() {
   const date = h("input", { type: "date", id: "game-date", value: S.todayISO() });
   const half = h("input", { type: "number", id: "half-length", inputmode: "numeric", min: 1, max: 60, value: app.meta.lastHalfLength ?? 30 });
   const error = h("p", { class: "field-error", hidden: true, id: "new-game-error" });
-  const checks = players.map((p) => h("input", { type: "checkbox", checked: true, value: p.id }));
+  const sheet = rosterEditor(S.defaultRoster(app.state));
 
   return h("section", {},
     h("h1", {}, "New game"),
@@ -292,8 +298,7 @@ function viewNewGame() {
       onsubmit: (e) => {
         e.preventDefault();
         const res = S.createGame(app.state, {
-          opponent: opponent.value, date: date.value, halfLength: Number(half.value),
-          squad: checks.filter((c) => c.checked).map((c) => Number(c.value)),
+          opponent: opponent.value, date: date.value, halfLength: Number(half.value), roster: sheet.read(),
         });
         if (res.error) {
           // createGame bails before touching state on error, so nothing to roll back.
@@ -310,21 +315,22 @@ function viewNewGame() {
       h("div", { class: "row field" },
         h("div", { class: "grow" }, h("label", { for: "game-date" }, "Date"), date),
         h("div", { style: "width:130px" }, h("label", { for: "half-length" }, "Half (mins)"), half)),
-      players.length
-        ? h("div", { class: "field" },
-            h("div", { class: "step" }, h("label", {}, "Who's playing?"),
-              h("button", { type: "button", class: "link-btn", onclick: () => { const all = checks.every((c) => c.checked); checks.forEach((c) => (c.checked = !all)); } }, "All / none")),
-            h("div", { class: "checks" }, players.map((p, i) => h("label", {}, checks[i], `#${p.number} ${p.name}`))))
-        : h("p", { class: "muted" }, "No squad yet. You can still log events against \"Unknown\", or add your squad first."),
+      h("div", { class: "field" },
+        h("label", {}, "Who's playing, and in which number?"),
+        !players.length && h("p", { class: "muted small" }, "No squad yet. Add players below, or on the Squad tab. You can also log events against \"Unknown\"."),
+        sheet.el),
       error,
       h("button", { type: "submit", class: "btn btn-block", id: "create-game" }, "Create game")));
 }
 
 // ---- Live entry
 
+/** The team sheet for this game: [{ id, number (worn today), name }], by number. */
 function matchdayPlayers(game) {
-  const ids = new Set(game.squad);
-  return S.activePlayers(app.state).filter((p) => ids.has(p.id));
+  return game.roster.map((r) => {
+    const p = app.state.players.find((p) => p.id === r.playerId);
+    return { id: r.playerId, number: r.number, name: p?.name ?? "" };
+  });
 }
 
 function viewLive(game) {
@@ -346,8 +352,9 @@ function viewLive(game) {
     h("div", { class: "live-head" },
       h("a", { class: "back", href: "#/games", "aria-label": "Back to games" }, "‹"),
       h("div", { class: "title" },
-        h("div", { class: "opp" }, `vs ${game.opponent}`),
-        h("div", {}, h("span", { class: "clock", id: "clock" }, S.formatClock(c.seconds)), " ",
+        // A long opponent name truncates; the goal count never does.
+        h("div", { class: "opp-line" }, h("span", { class: "opp" }, `vs ${game.opponent}`), h("span", { class: "badge", id: "goals" }, `Goals ${S.goalsFor(game)}`)),
+        h("div", { class: "clock-line" }, h("span", { class: "clock", id: "clock" }, S.formatClock(c.seconds)),
           h("span", { class: "phase-label", id: "phase-label" }, PHASE_LABEL[c.phase]))),
       next
         ? h("button", { type: "button", class: "btn phase-btn", id: "phase-btn", onclick: () => phaseAction(game) }, next)
@@ -358,7 +365,7 @@ function viewLive(game) {
       S.EVENT_TYPES.map((t) => h("button", {
         type: "button", class: "ev-btn", "aria-pressed": String(pend.type === t.id), "data-event": t.id,
         onclick: () => { pend.type = pend.type === t.id ? undefined : t.id; afterPick(game); },
-      }, symbolIcon(t.id, 18), t.label))),
+      }, symbolIcon(t.id, 18), h("span", {}, t.label)))),
     h("div", { class: "players", role: "group", "aria-label": "Player" },
       players.map((p) => h("button", {
         type: "button", class: "pl-btn", "aria-pressed": String(pend.playerId === p.id), "data-number": p.number,
@@ -387,7 +394,7 @@ function afterPick(game) {
     app.pending = { gameId: game.id };
     navigator.vibrate?.(30);
     render();
-    toast(`${S.minuteLabel(ev, game.halfLength)} ${S.playerLabel(app.state, ev.playerId)} · ${S.eventType(ev.type).label}`,
+    toast(`${ev.type === "goal" ? "GOAL! " : ""}${S.minuteLabel(ev, game.halfLength)} ${S.eventPlayerLabel(app.state, ev)} · ${S.eventType(ev.type).label}`,
       () => commit(() => S.deleteEvent(game, ev.id)));
   } else {
     render();
@@ -400,7 +407,7 @@ function eventRow(game, e) {
     symbolIcon(e.type, 18),
     h("div", { class: "main" },
       h("div", { class: "primary" }, S.eventType(e.type).label),
-      h("div", { class: "secondary" }, S.playerLabel(app.state, e.playerId))),
+      h("div", { class: "secondary" }, S.eventPlayerLabel(app.state, e))),
     h("button", {
       type: "button", class: "link-btn", "aria-label": `Delete ${S.eventType(e.type).label} at ${S.minuteLabel(e, game.halfLength)}`,
       onclick: () => {
@@ -432,19 +439,68 @@ function phaseAction(game) {
 }
 
 function editMatchday(game) {
-  const players = S.activePlayers(app.state);
-  if (!players.length) {
-    openDialog({ title: "No squad yet", body: h("p", {}, "Add players on the Squad tab first."), cancel: false, onOk: () => {} });
-    return;
-  }
-  const set = new Set(game.squad);
-  const checks = players.map((p) => h("input", { type: "checkbox", checked: set.has(p.id), value: p.id }));
+  const sheet = rosterEditor(game.roster);
   openDialog({
-    title: "Who's playing?",
-    body: h("div", { class: "checks" }, players.map((p, i) => h("label", {}, checks[i], `#${p.number} ${p.name}`))),
+    title: "Team sheet for this game",
+    body: [h("p", { class: "muted small" }, "Numbers here are for this game only. Events already logged keep the number worn at the time."), sheet.el],
     okLabel: "Save",
-    onOk: () => commit(() => { game.squad = checks.filter((c) => c.checked).map((c) => Number(c.value)); }),
+    onOk: () => {
+      const res = S.checkRoster(app.state, sheet.read());
+      if (res.error) return res.error;
+      commit(() => S.setRoster(app.state, game, sheet.read()));
+    },
   });
+}
+
+/**
+ * Team-sheet editor: tick who's playing and set today's shirt numbers, or add
+ * someone new on the spot. read() returns [{ playerId, number }] as typed.
+ */
+function rosterEditor(roster) {
+  const onSheet = new Map(roster.map((r) => [r.playerId, r.number]));
+  // Everyone in the squad, plus anyone on this sheet who has since left the squad.
+  const people = [...S.activePlayers(app.state), ...app.state.players.filter((p) => p.removed && onSheet.has(p.id))];
+  const rows = [];
+  const list = h("div", { class: "roster" });
+  const addRow = (p, checked, number) => {
+    const check = h("input", { type: "checkbox", checked, "aria-label": `${p.name || "#" + p.number} is playing` });
+    const num = h("input", {
+      class: "roster-num", inputmode: "numeric", maxlength: 3, value: number, "aria-label": `Shirt number for ${p.name || "#" + p.number}`,
+      oninput: () => (check.checked = true),
+    });
+    rows.push({ p, check, num });
+    list.append(h("div", { class: "roster-row", "data-player": p.name || p.number },
+      h("label", {}, check, h("span", {}, p.name || h("span", { class: "muted" }, "(no name)"))), num));
+  };
+  for (const p of people) addRow(p, onSheet.has(p.id), onSheet.get(p.id) ?? p.number);
+
+  const newNum = h("input", { class: "roster-num", inputmode: "numeric", maxlength: 3, placeholder: "No.", "aria-label": "New player's number", id: "new-num" });
+  const newName = h("input", { placeholder: "New player's name", maxlength: 40, "aria-label": "New player's name", id: "new-name" });
+  const newErr = h("p", { class: "field-error", hidden: true });
+  const addNew = () => {
+    const res = S.addPlayer(app.state, newNum.value, newName.value);
+    if (res.error) {
+      newErr.textContent = res.error;
+      newErr.hidden = false;
+      return;
+    }
+    commit(() => {}, { rerender: false }); // joins the squad straight away
+    addRow(res.player, true, res.player.number);
+    newNum.value = newName.value = "";
+    newErr.hidden = true;
+    newNum.focus();
+  };
+  newName.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); addNew(); } });
+
+  const el = h("div", {},
+    h("div", { class: "row", style: "justify-content:flex-end;margin-bottom:4px" },
+      h("button", { type: "button", class: "link-btn small", onclick: () => { const all = rows.every((r) => r.check.checked); rows.forEach((r) => (r.check.checked = !all)); } }, "All / none")),
+    list,
+    h("div", { class: "row", style: "margin-top:8px" },
+      h("div", { class: "num" }, newNum), h("div", { class: "grow" }, newName),
+      h("button", { type: "button", class: "btn btn-quiet", id: "add-to-sheet", onclick: addNew }, "Add")),
+    newErr);
+  return { el, read: () => rows.filter((r) => r.check.checked).map((r) => ({ playerId: r.p.id, number: r.num.value })) };
 }
 
 // ---- Pitch
@@ -522,13 +578,13 @@ function viewStats(game) {
         type: "button", class: "chip", "aria-pressed": String(f.types.has(et.id)),
         onclick: () => { f.types.has(et.id) ? f.types.delete(et.id) : f.types.add(et.id); render(); },
       }, symbolIcon(et.id, 14), et.label))),
-    f.playerId !== undefined && h("p", { class: "small" }, `Showing ${S.playerLabel(app.state, f.playerId)} only. `,
+    f.playerId !== undefined && h("p", { class: "small" }, `Showing ${S.gamePlayerLabel(app.state, game, f.playerId)} only. `,
       h("button", { type: "button", class: "link-btn", onclick: () => { f.playerId = undefined; render(); } }, "Show everyone")),
     pitchSvg({ marks: shown, label: `Pitch map of ${plural(shown.length, "event")}. Your team attacks to the right.` }),
     h("p", { class: "muted small", style: "margin-top:6px" }, "Attacking →. Filled = won / on target, hollow = lost / off target."),
     h("h2", {}, "By player"),
     t.byPlayer.size
-      ? [h("p", { class: "muted small" }, "Tap a player to show only their events on the map."), statsTable(t, { selectable: true })]
+      ? [h("p", { class: "muted small" }, "Tap a player to show only their events on the map."), statsTable(t, { selectable: true, game })]
       : h("p", { class: "muted" }, "No events yet."),
     game.events.length > 0 && h("details", { style: "margin-top:20px" },
       h("summary", { style: "font-weight:700;cursor:pointer;font-size:1.15rem" }, `All events (${game.events.length})`),
@@ -543,14 +599,15 @@ function viewStats(game) {
       }) }, "Delete game")));
 }
 
-function statsTable(t, { selectable }) {
+/** With a game, players are labelled and sorted by the number they wore in it. */
+function statsTable(t, { selectable, game }) {
+  const labelFor = (k) => (game ? S.gamePlayerLabel(app.state, game, k) : S.playerLabel(app.state, k));
+  const numberFor = (k) => game?.roster.find((r) => r.playerId === k)?.number ?? app.state.players.find((p) => p.id === k)?.number ?? 0;
   const f = app.statsFilter;
   const keys = [...t.byPlayer.keys()].sort((a, b) => {
     if (a === "unknown") return 1;
     if (b === "unknown") return -1;
-    const pa = app.state.players.find((p) => p.id === a);
-    const pb = app.state.players.find((p) => p.id === b);
-    return (pa?.number ?? 0) - (pb?.number ?? 0);
+    return numberFor(a) - numberFor(b);
   });
   const sum = (counts) => S.EVENT_IDS.reduce((n, id) => n + counts[id], 0);
   return h("div", { class: "table-wrap" }, h("table", {},
@@ -561,7 +618,7 @@ function statsTable(t, { selectable }) {
         class: selectable ? "clickable" : null,
         "aria-selected": selectable ? String(f.playerId === k) : null,
         onclick: selectable ? () => { f.playerId = f.playerId === k ? undefined : k; render(); } : null,
-      }, h("td", {}, S.playerLabel(app.state, k)), S.EVENT_IDS.map((id) => h("td", { class: "num" }, counts[id] || "·")), h("td", { class: "num" }, sum(counts)));
+      }, h("td", {}, labelFor(k)), S.EVENT_IDS.map((id) => h("td", { class: "num" }, counts[id] || "·")), h("td", { class: "num" }, sum(counts)));
     })),
     h("tfoot", {}, h("tr", {}, h("td", {}, "Team"), S.EVENT_IDS.map((id) => h("td", { class: "num" }, t.total[id])), h("td", { class: "num" }, sum(t.total))))));
 }
@@ -597,6 +654,7 @@ function viewSquad() {
 
   return h("section", {},
     h("h1", {}, "Squad"),
+    h("p", { class: "muted small" }, "Everyone who might play, with their usual number. For each game you pick who's playing and can change numbers for that day."),
     h("form", {
       novalidate: true,
       onsubmit: (e) => {
@@ -627,7 +685,7 @@ function viewSquad() {
       h("div", { class: "main" }, h("div", { class: "primary" }, p.name || h("span", { class: "muted" }, "(no name)"))),
       h("button", { type: "button", class: "link-btn", "aria-label": `Edit #${p.number}`, onclick: () => editPlayer(p) }, "Edit"),
       h("button", { type: "button", class: "link-btn", "aria-label": `Remove #${p.number}`, onclick: () => openDialog({
-        title: `Remove #${p.number} ${p.name}?`, body: h("p", {}, "Their stats in past games are kept."), okLabel: "Remove", danger: true,
+        title: `Remove #${p.number} ${p.name}?`, body: h("p", {}, "They won't be offered for new games. Past games and stats keep them."), okLabel: "Remove", danger: true,
         onOk: () => commit((st) => S.removePlayer(st, p.id)),
       }) }, "Remove")))));
 }

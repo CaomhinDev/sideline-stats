@@ -51,15 +51,15 @@ test("importSquad add skips used numbers; replace retires old squad but keeps st
   assert.deepEqual(S.importSquad(st, [{ number: 9, name: "Dup" }, { number: 5, name: "New" }], "add"), { added: 1, skipped: [9] });
   S.importSquad(st, [{ number: 2, name: "Fresh" }], "replace");
   assert.deepEqual(S.activePlayers(st).map((p) => p.number), [2]);
-  // #9 had an event so is hidden but still labelled; #1 had none so is gone.
+  // Both were on the game's team sheet, so they're hidden rather than deleted.
   assert.equal(S.playerLabel(st, g.events[0].playerId), "#9 Jordan");
-  assert.equal(st.players.some((p) => p.number === 1), false);
+  assert.equal(st.players.find((p) => p.number === 1).removed, true);
 });
 
 test("game phases advance and can be undone", () => {
   const st = squad();
   const g = S.createGame(st, { opponent: "Rovers", halfLength: 30 }).game;
-  assert.equal(g.squad.length, 2);
+  assert.equal(g.roster.length, 2);
   assert.equal(S.phase(g), "pre");
   assert.equal(S.advancePhase(g, 1000), "first");
   assert.equal(S.advancePhase(g, 1000 + 31 * 60_000), "half");
@@ -101,7 +101,7 @@ test("events record half, clock time and clamped position", () => {
   S.advancePhase(g, 0);
   const e = S.addEvent(st, g, { type: "shot_on", playerId: null, x: 1.4, y: -0.2 }, 125_000);
   assert.deepEqual({ half: e.half, t: e.t, x: e.x, y: e.y, playerId: e.playerId }, { half: 1, t: 125, x: 1, y: 0, playerId: null });
-  assert.throws(() => S.addEvent(st, g, { type: "goal", x: 0, y: 0 }), /Unknown event/);
+  assert.throws(() => S.addEvent(st, g, { type: "corner", x: 0, y: 0 }), /Unknown event/);
 });
 
 test("tally counts by type and player", () => {
@@ -126,7 +126,7 @@ test("CSV export lists events in match order with escaping", () => {
   const lines = S.gameCSV(st, g).trim().split("\n");
   assert.equal(lines.length, 3);
   assert.match(lines[1], /^1',1,00:30,Tackle won,,Unknown,/);
-  assert.match(lines[2], /^2',1,01:30,Won in air,5,"Kev ""The Wall"", Jr",0.25,0.5$/);
+  assert.match(lines[2], /^2',1,01:30,Header won,5,"Kev ""The Wall"", Jr",0.25,0.5$/);
 });
 
 test("export/import round-trips and rejects bad files", () => {
@@ -143,17 +143,71 @@ test("export/import round-trips and rejects bad files", () => {
   const bad = (mut) => { const d = structuredClone(ok); mut(d); return JSON.stringify(d); };
   assert.throws(() => S.parseState("nope"), /valid JSON/);
   assert.throws(() => S.parseState(bad((d) => (d.format = "weigh-in"))), /different app/);
-  assert.throws(() => S.parseState(bad((d) => (d.games[0].events[0].type = "goal"))), /unknown type/);
+  assert.throws(() => S.parseState(bad((d) => (d.games[0].events[0].type = "corner"))), /unknown type/);
   assert.throws(() => S.parseState(bad((d) => (d.games[0].events[0].playerId = 999))), /unknown player/);
   assert.throws(() => S.parseState(bad((d) => (d.games[0].halfLength = 0))), /half length/);
   assert.throws(() => S.parseState(bad((d) => (d.games[0].events[0].id = d.players[0].id))), /Duplicate id/);
   assert.throws(() => S.parseState(bad((d) => (d.players[0].number = "x"))), /invalid number/);
+  assert.throws(() => S.parseState(bad((d) => (d.games[0].events[0].number = "x"))), /invalid shirt number/);
+  assert.throws(() => S.parseState(bad((d) => d.games[0].roster.push({ ...d.games[0].roster[0], playerId: d.players[1].id }))), /both have/);
 });
 
-test("removing a player without events deletes them and drops them from squads", () => {
+test("removing a player who never played deletes them; past team sheets are untouched", () => {
   const st = squad();
-  const g = S.createGame(st, { opponent: "R", halfLength: 30 }).game;
-  S.removePlayer(st, st.players[0].id);
-  assert.equal(st.players.length, 1);
-  assert.equal(g.squad.length, 1);
+  const [keeper, striker] = st.players;
+  const g = S.createGame(st, { opponent: "R", halfLength: 30, roster: [{ playerId: striker.id, number: 9 }] }).game;
+  S.removePlayer(st, keeper.id);
+  assert.equal(st.players.some((p) => p.id === keeper.id), false);
+  S.removePlayer(st, striker.id);
+  assert.equal(st.players.find((p) => p.id === striker.id).removed, true);
+  assert.deepEqual(g.roster, [{ playerId: striker.id, number: 9 }]);
+  assert.deepEqual(S.defaultRoster(st), []);
+});
+
+test("each game has its own team sheet and numbers", () => {
+  const st = squad();
+  const [sam, jordan] = st.players;
+  S.addPlayer(st, "4", "Chris");
+  const chris = st.players[2];
+  // Jordan wears 10 today; Chris isn't playing.
+  const g1 = S.createGame(st, { opponent: "R", halfLength: 30, roster: [{ playerId: sam.id, number: "1" }, { playerId: jordan.id, number: "10" }] }).game;
+  assert.deepEqual(g1.roster.map((r) => r.number), [1, 10]);
+  assert.match(S.createGame(st, { opponent: "R", halfLength: 30, roster: [{ playerId: sam.id, number: 5 }, { playerId: chris.id, number: 5 }] }).error, /both have #5/);
+  assert.match(S.createGame(st, { opponent: "R", halfLength: 30, roster: [{ playerId: sam.id, number: "" }] }).error, /shirt number for Sam Keeper/);
+  // Defaults follow the squad's usual numbers.
+  assert.deepEqual(S.defaultRoster(st).map((r) => r.number), [1, 4, 9]);
+
+  S.advancePhase(g1, 0);
+  const e = S.addEvent(st, g1, { type: "goal", playerId: jordan.id, x: 0.9, y: 0.5 }, 60_000);
+  assert.equal(e.number, 10);
+  assert.equal(S.eventPlayerLabel(st, e), "#10 Jordan");
+  assert.equal(S.gamePlayerLabel(st, g1, jordan.id), "#10 Jordan");
+  assert.equal(S.playerLabel(st, jordan.id), "#9 Jordan"); // season view uses the usual number
+  assert.equal(S.goalsFor(g1), 1);
+
+  // Changing the sheet mid-game (Jordan switches to 11) doesn't rewrite the earlier goal.
+  assert.ok(!S.setRoster(st, g1, [{ playerId: jordan.id, number: 11 }, { playerId: chris.id, number: 4 }]).error);
+  assert.equal(S.eventPlayerLabel(st, e), "#10 Jordan");
+  assert.equal(S.gamePlayerLabel(st, g1, jordan.id), "#11 Jordan");
+  assert.match(S.setRoster(st, g1, [{ playerId: jordan.id, number: 4 }, { playerId: chris.id, number: 4 }]).error, /both have #4/);
+  assert.deepEqual(g1.roster.map((r) => r.number), [4, 11]); // unchanged after the rejected edit
+  // Season totals are by person, whatever number they wore.
+  assert.equal(S.seasonTally(st).byPlayer.get(jordan.id).goal, 1);
+});
+
+test("version 1 data (squad lists, no numbers on events) is upgraded on load", () => {
+  const v1 = {
+    format: "sideline-stats", version: 1, nextId: 20,
+    players: [{ id: 1, number: 7, name: "Sam" }, { id: 2, number: 9, name: "Jo" }],
+    games: [{
+      id: 3, opponent: "Rovers", date: "2026-11-01", halfLength: 30, squad: [1, 2],
+      periods: [{ start: 0, end: 1800000 }],
+      events: [{ id: 4, type: "air_won", playerId: 2, x: 0.5, y: 0.5, half: 1, t: 60 }, { id: 5, type: "shot_on", playerId: null, x: 1, y: 0.5, half: 1, t: 70 }],
+    }],
+  };
+  const st = S.parseState(JSON.stringify(v1));
+  assert.deepEqual(st.games[0].roster, [{ playerId: 1, number: 7 }, { playerId: 2, number: 9 }]);
+  assert.equal(st.games[0].events[0].number, 9);
+  assert.equal(st.games[0].events[1].number, null);
+  assert.equal(S.eventType("air_won").label, "Header won"); // old ids, new names
 });

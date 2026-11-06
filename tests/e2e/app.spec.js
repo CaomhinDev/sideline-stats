@@ -20,7 +20,7 @@ async function newGame(page, opponent = "Rovers", half = "30") {
   await page.locator("#opponent").fill(opponent);
   await page.locator("#half-length").fill(half);
   await page.locator("#create-game").click();
-  await expect(page.locator(".live-head .opp")).toHaveText(`vs ${opponent}`);
+  await expect(page.locator(".live-head .opp")).toContainText(`vs ${opponent}`);
 }
 
 /** Taps the pitch at a fraction of its width/height (0,0 = top-left, our goal on the left). */
@@ -107,6 +107,59 @@ test("live: three taps in any order record an event, with undo", async ({ page }
   // Survives a reload.
   await page.reload();
   await expect(page.locator("#recent li")).toHaveCount(2);
+});
+
+test("team sheet: per-game numbers, who's playing, and a late addition", async ({ page }) => {
+  await addSquad(page, "1 Sam\n7 Jamie\n9 Jordan\n10 Lee");
+  await page.goto("./#/new");
+  await page.locator("#opponent").fill("Rovers");
+  // Lee is away; Jordan wears 14 today.
+  await page.locator('.roster-row[data-player="Lee"] input[type=checkbox]').uncheck();
+  await page.getByLabel("Shirt number for Jordan").fill("14");
+  await page.locator("#create-game").click();
+  await expect(page.locator(".pl-btn .n")).toHaveText(["1", "7", "14", "?"]);
+
+  // Jordan scores wearing 14.
+  await ev(page, "goal").click();
+  await pl(page, 14).click();
+  await tapPitch(page, 0.95, 0.5);
+  await expect(page.locator("#live-status")).toContainText("GOAL! 1' #14 Jordan · Goal");
+  await expect(page.locator("#goals")).toHaveText("Goals 1");
+
+  // Mid-game: Jordan switches to 9, a new player (#22 Kim) arrives.
+  await page.getByRole("button", { name: "Edit players" }).click();
+  await page.getByLabel("Shirt number for Jordan").fill("9");
+  await page.locator("#new-num").fill("22");
+  await page.locator("#new-name").fill("Kim");
+  await page.locator("#add-to-sheet").click();
+  await page.locator("#dialog-ok").click();
+  await expect(page.locator(".pl-btn .n")).toHaveText(["1", "7", "9", "22", "?"]);
+  // The earlier goal still shows the number worn at the time.
+  await expect(page.locator("#recent li").first()).toContainText("#14 Jordan");
+
+  // Clashing numbers are refused.
+  await page.getByRole("button", { name: "Edit players" }).click();
+  await page.getByLabel("Shirt number for Kim").fill("7");
+  await page.locator("#dialog-ok").click();
+  await expect(page.locator("#dialog-error")).toContainText("both have #7");
+  await page.locator("#dialog-cancel").click();
+
+  // Kim joined the squad with her usual number; the squad's numbers are unchanged.
+  await page.goto("./#/squad");
+  await expect(page.locator("#squad-list li")).toHaveText([/1\s*Sam/, /7\s*Jamie/, /9\s*Jordan/, /10\s*Lee/, /22\s*Kim/]);
+});
+
+test("data saved by the first version still loads", async ({ page }) => {
+  await page.goto("./");
+  await page.evaluate(() => localStorage.setItem("sideline.data.v1", JSON.stringify({
+    nextId: 20, players: [{ id: 1, number: 7, name: "Sam" }],
+    games: [{ id: 2, opponent: "Old FC", date: "2026-11-01", halfLength: 30, squad: [1], periods: [], events: [{ id: 3, type: "air_won", playerId: 1, x: 0.5, y: 0.5, half: 1, t: 0 }] }],
+  })));
+  await page.reload();
+  await page.goto("./#/game/2");
+  await expect(page.locator(".pl-btn .n")).toHaveText(["7", "?"]);
+  await expect(page.locator("#recent li")).toContainText("Header won");
+  await expect(page.locator("#recent li")).toContainText("#7 Sam");
 });
 
 test("clock: start, half time, second half from half length, full time; survives reload", async ({ page }) => {
@@ -245,7 +298,7 @@ test("live screen fits a phone: pitch, events and first players without scrollin
   await addSquad(page, SQUAD + "\n17 Ben\n18 Tom\n19 Max\n20 Ollie");
   await newGame(page);
   const vh = 740;
-  for (const sel of ["#pitch", '[data-event="shot_off"]', '.pl-btn[data-number="unknown"]']) {
+  for (const sel of ["#pitch", '[data-event="goal"]', '.pl-btn[data-number="unknown"]']) {
     const box = await page.locator(sel).boundingBox();
     expect(box.y + box.height, sel).toBeLessThanOrEqual(vh);
   }

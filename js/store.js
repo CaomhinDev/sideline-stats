@@ -1,15 +1,20 @@
 // Pure data logic: no DOM, no storage. Functions mutate the state they're given.
 
 export const FORMAT = "sideline-stats";
-export const VERSION = 1;
+export const VERSION = 2; // 2: per-game rosters and shirt numbers on events
 
-/** The five things that can happen. Group drives chart colour; positive drives fill. */
+/**
+ * What can happen. Ids are stored in saved data, so never rename them; labels are free to change.
+ * group drives colour (defending / aerial / attacking), shape tells types apart, positive=false draws hollow.
+ */
 export const EVENT_TYPES = [
-  { id: "tackle_won", label: "Tackle won", short: "Tkl W", group: 0, positive: true },
-  { id: "air_won", label: "Won in air", short: "Air W", group: 1, positive: true },
-  { id: "air_lost", label: "Lost in air", short: "Air L", group: 1, positive: false },
-  { id: "shot_on", label: "Shot on target", short: "On T", group: 2, positive: true },
-  { id: "shot_off", label: "Shot off target", short: "Off T", group: 2, positive: false },
+  { id: "tackle_won", label: "Tackle won", short: "Tkl", group: 0, shape: "circle", positive: true },
+  { id: "save", label: "Save", short: "Save", group: 0, shape: "diamond", positive: true },
+  { id: "air_won", label: "Header won", short: "Hdr W", group: 1, shape: "triangle", positive: true },
+  { id: "air_lost", label: "Header lost", short: "Hdr L", group: 1, shape: "triangle", positive: false },
+  { id: "shot_on", label: "Shot on target", short: "On T", group: 2, shape: "square", positive: true },
+  { id: "shot_off", label: "Shot off target", short: "Off T", group: 2, shape: "square", positive: false },
+  { id: "goal", label: "Goal", short: "Goal", group: 2, shape: "star", positive: true },
 ];
 export const EVENT_IDS = EVENT_TYPES.map((t) => t.id);
 export const eventType = (id) => EVENT_TYPES.find((t) => t.id === id);
@@ -68,17 +73,20 @@ export function updatePlayer(state, id, number, name) {
   return { player };
 }
 
-const playerHasEvents = (state, id) => state.games.some((g) => g.events.some((e) => e.playerId === id));
+const playerInHistory = (state, id) =>
+  state.games.some((g) => g.events.some((e) => e.playerId === id) || g.roster.some((r) => r.playerId === id));
 
-/** Players with recorded events are hidden, not deleted, so old stats keep their names. */
+/**
+ * Takes a player out of the squad. Anyone who appears in a game is hidden, not
+ * deleted, so old team sheets and stats keep their names.
+ */
 export function removePlayer(state, id) {
-  if (playerHasEvents(state, id)) {
+  if (playerInHistory(state, id)) {
     const p = state.players.find((p) => p.id === id);
     if (p) p.removed = true;
   } else {
     state.players = state.players.filter((p) => p.id !== id);
   }
-  for (const g of state.games) g.squad = g.squad.filter((pid) => pid !== id);
 }
 
 /**
@@ -141,17 +149,50 @@ export function importSquad(state, list, mode = "add") {
 
 // ---------------------------------------------------------------- games
 
-export function createGame(state, { opponent, date, halfLength, squad }) {
+/** The usual team sheet: every active squad player in their usual number. */
+export const defaultRoster = (state) => activePlayers(state).map((p) => ({ playerId: p.id, number: p.number }));
+
+/**
+ * Checks a game's team sheet: [{ playerId, number }], numbers as typed.
+ * Returns { roster } with numbers parsed, or { error }.
+ */
+export function checkRoster(state, roster) {
+  const out = [];
+  for (const r of roster) {
+    const p = state.players.find((p) => p.id === r.playerId);
+    if (!p) return { error: "Unknown player on the team sheet" };
+    const n = parseNumber(r.number);
+    const who = p.name || `#${p.number}`;
+    if (n == null) return { error: `Enter a shirt number for ${who}` };
+    const clash = out.find((o) => o.number === n);
+    if (clash) {
+      const other = state.players.find((p) => p.id === clash.playerId);
+      return { error: `${who} and ${other.name || "another player"} both have #${n}` };
+    }
+    out.push({ playerId: p.id, number: n });
+  }
+  return { roster: out.sort((a, b) => a.number - b.number) };
+}
+
+export function setRoster(state, game, roster) {
+  const res = checkRoster(state, roster);
+  if (!res.error) game.roster = res.roster;
+  return res;
+}
+
+export function createGame(state, { opponent, date, halfLength, roster }) {
   const name = String(opponent ?? "").trim();
   if (!name) return { error: "Enter the opponent's name" };
   const len = Number(halfLength);
   if (!Number.isInteger(len) || len < 1 || len > 60) return { error: "Half length must be 1–60 minutes" };
+  const sheet = checkRoster(state, roster ?? defaultRoster(state));
+  if (sheet.error) return { error: sheet.error };
   const game = {
     id: state.nextId++,
     opponent: name.slice(0, 60),
     date: isValidISODate(date) ? date : todayISO(),
     halfLength: len,
-    squad: squad ?? activePlayers(state).map((p) => p.id),
+    roster: sheet.roster,
     periods: [],
     events: [],
   };
@@ -224,14 +265,19 @@ export function minuteLabel(event, halfLength) {
   return `${Math.floor(event.t / 60) + 1}'`;
 }
 
-/** playerId null means "unknown player". x: 0 own goal → 1 their goal; y: 0 top → 1 bottom. */
+/**
+ * playerId null means "unknown player". x: 0 own goal → 1 their goal; y: 0 top → 1 bottom.
+ * The shirt number worn in this game is kept on the event, so later changes can't rewrite history.
+ */
 export function addEvent(state, game, { type, playerId, x, y }, now = Date.now()) {
   if (!EVENT_IDS.includes(type)) throw new Error(`Unknown event type ${type}`);
   const c = clock(game, now);
+  const pid = playerId ?? null;
   const event = {
     id: state.nextId++,
     type,
-    playerId: playerId ?? null,
+    playerId: pid,
+    number: pid == null ? null : (game.roster.find((r) => r.playerId === pid)?.number ?? state.players.find((p) => p.id === pid)?.number ?? null),
     x: Math.round(clamp01(x) * 1000) / 1000,
     y: Math.round(clamp01(y) * 1000) / 1000,
     half: c.half,
@@ -268,12 +314,30 @@ export function seasonTally(state) {
   return tally(state.games.flatMap((g) => g.events));
 }
 
+const label = (number, name) => (number == null ? name || "?" : name ? `#${number} ${name}` : `#${number}`);
+
+/** Player as known across the season: usual number and name. */
 export function playerLabel(state, id) {
   if (id == null || id === "unknown") return "Unknown";
   const p = state.players.find((p) => p.id === id);
-  if (!p) return "?";
-  return p.name ? `#${p.number} ${p.name}` : `#${p.number}`;
+  return p ? label(p.number, p.name) : "?";
 }
+
+/** Player as they appeared in one game: the number they wore that day. */
+export function gamePlayerLabel(state, game, id) {
+  if (id == null || id === "unknown") return "Unknown";
+  const p = state.players.find((p) => p.id === id);
+  const number = game.roster.find((r) => r.playerId === id)?.number ?? game.events.findLast((e) => e.playerId === id)?.number ?? p?.number;
+  return label(number, p?.name);
+}
+
+/** One event's player, with the number worn when it happened. */
+export function eventPlayerLabel(state, event) {
+  if (event.playerId == null) return "Unknown";
+  return label(event.number, state.players.find((p) => p.id === event.playerId)?.name);
+}
+
+export const goalsFor = (game) => game.events.filter((e) => e.type === "goal").length;
 
 const csvCell = (v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
 
@@ -282,7 +346,7 @@ export function gameCSV(state, game) {
   const sorted = [...game.events].sort((a, b) => a.half - b.half || a.t - b.t);
   for (const e of sorted) {
     const p = state.players.find((p) => p.id === e.playerId);
-    rows.push([minuteLabel(e, game.halfLength), e.half, formatClock(e.t), eventType(e.type).label, p?.number ?? "", p?.name ?? (p ? "" : "Unknown"), e.x, e.y]);
+    rows.push([minuteLabel(e, game.halfLength), e.half, formatClock(e.t), eventType(e.type).label, e.number ?? "", e.playerId == null ? "Unknown" : p?.name ?? "", e.x, e.y]);
   }
   return rows.map((r) => r.map(csvCell).join(",")).join("\n") + "\n";
 }
@@ -335,14 +399,26 @@ export function parseState(text) {
       if (!EVENT_IDS.includes(e.type)) throw new Error(`Event ${e.id} has an unknown type.`);
       if (e.playerId != null && !playerIds.has(e.playerId)) throw new Error(`Event ${e.id} belongs to an unknown player.`);
       if (![1, 2].includes(e.half) || !Number.isFinite(e.t) || e.t < 0) throw new Error(`Event ${e.id} has an invalid time.`);
-      return { id: e.id, type: e.type, playerId: e.playerId ?? null, x: clamp01(e.x), y: clamp01(e.y), half: e.half, t: Math.floor(e.t) };
+      if (e.number != null && parseNumber(e.number) == null) throw new Error(`Event ${e.id} has an invalid shirt number.`);
+      return { id: e.id, type: e.type, playerId: e.playerId ?? null, number: e.number == null ? null : parseNumber(e.number), x: clamp01(e.x), y: clamp01(e.y), half: e.half, t: Math.floor(e.t) };
     });
+    // Version 1 stored a list of player ids ("squad"); version 2 a team sheet with numbers.
+    const sheet = Array.isArray(g.roster)
+      ? g.roster
+      : (Array.isArray(g.squad) ? g.squad : []).filter((id) => playerIds.has(id)).map((id) => ({ playerId: id, number: state.players.find((p) => p.id === id).number }));
+    const checked = checkRoster(state, sheet.filter((r) => playerIds.has(r?.playerId)));
+    if (checked.error) throw new Error(`Game ${g.id}: ${checked.error}.`);
+    for (const e of events) {
+      if (e.playerId != null && e.number == null) {
+        e.number = checked.roster.find((r) => r.playerId === e.playerId)?.number ?? state.players.find((p) => p.id === e.playerId).number;
+      }
+    }
     state.games.push({
       id: g.id,
       opponent: g.opponent.trim(),
       date: isValidISODate(g.date) ? g.date : todayISO(),
       halfLength: g.halfLength,
-      squad: (Array.isArray(g.squad) ? g.squad : []).filter((id) => playerIds.has(id)),
+      roster: checked.roster,
       periods,
       events,
     });
