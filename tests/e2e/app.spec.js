@@ -563,3 +563,73 @@ test.describe("accounts", () => {
     await ctx.close();
   });
 });
+
+test.describe("signing out and sharing a team", () => {
+  test.use({ signIn: false });
+
+  test("sign out from the Account tab or the Games screen", async ({ page, email }) => {
+    await allow(email);
+    await page.goto("./");
+    await signInAs(page, email);
+    await page.getByRole("link", { name: "Account" }).click();
+    await expect(page.locator("#account")).toContainText(email);
+    await page.locator("#sign-out").click();
+    await expect(page.locator("#sign-in")).toBeVisible();
+
+    await signInAs(page, email);
+    await page.goto("./#/games");
+    await page.locator("#games-sign-out").click();
+    await expect(page.locator("#sign-in")).toBeVisible();
+  });
+
+  test("a shared team shows its squad, season totals and every game, view only", async ({ page, browser }) => {
+    const owner = freshEmail("owner");
+    const sister = freshEmail("sister");
+    await allow(owner);
+    await allow(sister);
+    await page.goto("./");
+    await signInAs(page, owner);
+    await addSquad(page, "4 Chris\n9 Jordan");
+    const opponent = `Rovers ${Date.now()}`;
+    await newGame(page, opponent);
+    await ev(page, "goal").click();
+    await pl(page, 9).click();
+    await tapPitch(page, 0.95, 0.5);
+
+    const ctx = await browser.newContext({ ...test.info().project.use });
+    const sis = await ctx.newPage();
+    await sis.addInitScript(() => { window.__SIDELINE_EMULATOR = true; });
+    await sis.goto(new URL("./", page.url()).href);
+    await signInAs(sis, sister);
+
+    // Share the team from the Squad tab; the game wasn't individually shared.
+    await page.goto("./#/squad");
+    await page.locator("#share-team").check();
+    await expect(sis.locator("#shared-teams li")).not.toHaveCount(0);
+    // Other tests may share teams too, so find this owner's row by its link.
+    await expect(sis.locator("#shared-teams li", { hasText: "2 players · 1 game" })).not.toHaveCount(0);
+    const href = await sis.locator("#shared-teams li", { hasText: "2 players · 1 game" }).locator("a").first().getAttribute("href");
+    const mine = sis.locator(`#shared-teams li:has(a[href="${href}"])`);
+    await expect(mine).toHaveCount(1);
+    await mine.locator("a").click();
+    await expect(sis.locator("#team-squad li")).toHaveText([/4\s*Chris/, /9\s*Jordan/]);
+    await expect(sis.locator("#team-games li")).toContainText(opponent);
+    await expect(sis.locator("tbody")).toContainText("#9 Jordan");
+    await sis.locator("#team-games li a").first().click();
+    await expect(sis.locator("h1")).toContainText(opponent);
+    await expect(sis.getByRole("button", { name: "Delete game" })).toHaveCount(0);
+
+    // A game created after sharing is visible too.
+    const later = `Later ${Date.now()}`;
+    await newGame(page, later);
+    await sis.goto(new URL("./#/games", page.url()).href);
+    await expect(mine).toContainText("2 games");
+
+    // Unsharing the team hides it all again.
+    await page.goto("./#/squad");
+    await page.locator("#share-team").uncheck();
+    await expect(mine).toHaveCount(0);
+    await expect(sis.locator("#shared-list li", { hasText: opponent })).toHaveCount(0);
+    await ctx.close();
+  });
+});

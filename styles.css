@@ -268,3 +268,5 @@ tr.them-row td { color: var(--text-2); font-weight: 600; }
 .gate .btn-block { margin-top: 12px; }
 .share-toggle { display: flex; align-items: flex-start; gap: 12px; font-weight: 400; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); margin: 4px 0 8px; cursor: pointer; }
 .share-toggle input { width: 22px; height: 22px; margin-top: 2px; flex: none; }
+.signed-in-as { margin-top: 28px; text-align: center; }
+.signed-in-as .link-btn { padding: 4px 6px; min-height: 0; text-decoration: underline; }

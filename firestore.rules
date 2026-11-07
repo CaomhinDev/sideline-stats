@@ -4,7 +4,8 @@ rules_version = '2';
 // - Only Google accounts listed in /allow/{email} can use the app at all. That list
 //   is managed in the Firebase console (it is never readable or writable by the app,
 //   except that you can check your own entry).
-// - Your squad lives in /users/{uid}; only you can read or write it.
+// - Your squad lives in /users/{uid}; only you can change it. If you share your
+//   team, everyone on the allowlist can view it (and all your games are shared).
 // - Each game is /games/{uid}_{id}. Only its creator can change it. If the creator
 //   marks it shared, everyone on the allowlist can view it (read only).
 service cloud.firestore {
@@ -33,8 +34,10 @@ service cloud.firestore {
       allow list, write: if false;
     }
 
+    // Your squad. If you share your team, family can read it (never change it).
     match /users/{uid} {
-      allow read, write: if allowed() && request.auth.uid == uid;
+      allow read: if allowed() && (request.auth.uid == uid || resource.data.shared == true);
+      allow write: if allowed() && request.auth.uid == uid;
     }
 
     match /games/{gameId} {

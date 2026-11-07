@@ -351,3 +351,10 @@ test("version 2 data gains empty lineups and subs; current data round-trips", ()
   bad.games[0].subs[0].on = [999];
   assert.throws(() => S.parseState(JSON.stringify(bad)), /unknown player in its substitution/);
 });
+
+test("team sharing survives export and import", () => {
+  const st = S.emptyState();
+  st.shareTeam = true;
+  assert.equal(S.parseState(JSON.stringify(S.toExport(st))).shareTeam, true);
+  assert.equal(S.parseState(JSON.stringify(S.toExport(S.emptyState()))).shareTeam, undefined);
+});

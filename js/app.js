@@ -22,7 +22,8 @@ const app = {
   user: null,
   access: "checking",
   authError: null,
-  shared: [], // games others have shared: [{ docId, ownerName, names, game }]
+  shared: [], // games others have shared: [{ docId, owner, ownerName, names, game }]
+  sharedTeams: [], // teams others have shared: [{ uid, ownerName, players }]
   route: { name: "games" },
   pending: null, // live entry: { gameId, x, y, type, playerId } – playerId undefined = not chosen, null = unknown
   statsFilter: { half: 0, types: new Set(S.EVENT_IDS), playerId: undefined },
@@ -89,18 +90,20 @@ function pushChanges() {
     return;
   }
   const uid = app.user.uid;
-  const players = JSON.stringify(app.state.players);
+  const teamShared = app.state.shareTeam === true;
+  const players = JSON.stringify({ players: app.state.players, teamShared });
   if (players !== sent.players) {
     sent.players = players;
-    track(cloud.saveUser(uid, { players: app.state.players }));
+    track(cloud.saveUser(app.user, { players: app.state.players, shared: teamShared }));
   }
   const live = new Set();
   for (const g of app.state.games) {
     live.add(g.id);
-    const json = JSON.stringify(g);
+    // Sharing the team shares every game, so a change to that switch re-sends them all.
+    const json = JSON.stringify(g) + (teamShared ? "|team" : "");
     if (sent.games.get(g.id) !== json) {
       sent.games.set(g.id, json);
-      track(cloud.saveGame(app.user, g, namesFor(g)));
+      track(cloud.saveGame(app.user, g, namesFor(g), teamShared || g.shared === true));
     }
   }
   for (const id of [...sent.games.keys()]) {
@@ -152,7 +155,7 @@ function receive(user, games, fromServer) {
   }
   let incoming;
   try {
-    incoming = S.parseState({ players: user?.players ?? [], games });
+    incoming = S.parseState({ players: user?.players ?? [], games, shareTeam: user?.shared === true });
   } catch (e) {
     console.warn("Ignoring unreadable cloud data:", e);
     return;
@@ -161,8 +164,9 @@ function receive(user, games, fromServer) {
   // dialogs and Undo buttons hold references to them) unless something really changed.
   if (canonical(incoming) === canonical(app.state)) return;
   incoming.nextId = Math.max(incoming.nextId, app.state.nextId);
-  sent.players = JSON.stringify(incoming.players);
-  sent.games = new Map(incoming.games.map((g) => [g.id, JSON.stringify(g)]));
+  const teamShared = incoming.shareTeam === true;
+  sent.players = JSON.stringify({ players: incoming.players, teamShared });
+  sent.games = new Map(incoming.games.map((g) => [g.id, JSON.stringify(g) + (teamShared ? "|team" : "")]));
   app.state = incoming;
   storage.saveState(app.state);
   render();
@@ -171,9 +175,9 @@ function receive(user, games, fromServer) {
 /** Squad and games in a fixed shape and order, for comparing two copies. */
 function canonical(state) {
   try {
-    const st = S.parseState({ players: state.players, games: state.games });
+    const st = S.parseState({ players: state.players, games: state.games, shareTeam: state.shareTeam === true });
     st.games.sort((a, b) => a.id - b.id);
-    return JSON.stringify({ players: st.players, games: st.games });
+    return JSON.stringify({ players: st.players, games: st.games, shareTeam: st.shareTeam === true });
   } catch {
     return Math.random().toString(); // unreadable: treat as different
   }
@@ -197,6 +201,7 @@ async function startAccount(user) {
   sent.players = null;
   sent.games = new Map();
   app.shared = [];
+  app.sharedTeams = [];
   app.user = user;
   app.authError = null;
   if (!user) {
@@ -233,7 +238,8 @@ async function startAccount(user) {
   }
   stopWatching.push(
     cloud.watchMine(user.uid, receive, syncFailed),
-    cloud.watchShared(user.uid, (list) => { app.shared = list; if (["games", "shared"].includes(app.route.name)) render(); }, (e) => console.warn("Shared games unavailable:", e)),
+    cloud.watchShared(user.uid, (list) => { app.shared = list; if (["games", "shared", "team"].includes(app.route.name)) render(); }, (e) => console.warn("Shared games unavailable:", e)),
+    cloud.watchSharedTeams(user.uid, (list) => { app.sharedTeams = list; if (["games", "team"].includes(app.route.name)) render(); }, (e) => console.warn("Shared teams unavailable:", e)),
   );
 }
 
@@ -410,6 +416,7 @@ function parseRoute() {
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   if (parts[0] === "game" && parts[1]) return { name: parts[2] === "stats" ? "stats" : "live", id: Number(parts[1]) };
   if (parts[0] === "shared" && parts[1]) return { name: "shared", docId: decodeURIComponent(parts[1]) };
+  if (parts[0] === "team" && parts[1]) return { name: "team", uid: decodeURIComponent(parts[1]) };
   if (["games", "squad", "data", "new"].includes(parts[0])) return { name: parts[0] };
   return { name: "games" };
 }
@@ -449,13 +456,13 @@ function render() {
   const live = r.name === "live";
   document.body.classList.toggle("live", live);
   document.getElementById("tabs").hidden = live;
-  const tab = ["new", "stats", "shared"].includes(r.name) ? "games" : r.name;
+  const tab = ["new", "stats", "shared", "team"].includes(r.name) ? "games" : r.name;
   for (const a of document.querySelectorAll(".tabs a")) {
     if (a.dataset.tab === tab) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
   }
   renderBanner(live);
-  const views = { games: viewGames, new: viewNewGame, live: () => viewLive(game), stats: () => viewStats(game), shared: viewShared, squad: viewSquad, data: viewData };
+  const views = { games: viewGames, new: viewNewGame, live: () => viewLive(game), stats: () => viewStats(game), shared: viewShared, team: viewTeam, squad: viewSquad, data: viewData };
   view.replaceChildren(views[r.name]());
   updateWakeLock(live && S.clock(game).running);
   tick();
@@ -537,17 +544,71 @@ function viewShared() {
       h("h1", {}, "Not available"),
       h("p", { class: "muted" }, app.shared.length ? "This game is no longer shared with you." : "Loading shared games…"));
   }
+  const read = readShared(item);
+  if (!read) {
+    return h("section", {}, h("a", { class: "link-btn", href: "#/games" }, "‹ Games"), h("h1", {}, "Can't show this game"), h("p", { class: "muted" }, "Its data couldn't be read."));
+  }
+  return viewStats(read.game, { st: read.st, readOnly: true, sharedBy: item.ownerName || "family" });
+}
+
+// ---- A family member's shared team (view only)
+
+/** A shared game as a readable { st, game }, or null if it can't be read. */
+function readShared(item) {
   const players = Object.entries(item.names ?? {}).map(([id, p]) => ({ id: Number(id), number: p.number, name: p.name ?? "" }));
+  try {
+    const st = S.parseState({ players, games: [item.game] });
+    return { st, game: st.games[0] };
+  } catch {
+    return null;
+  }
+}
+
+function viewTeam() {
+  const team = app.sharedTeams.find((t) => t.uid === app.route.uid);
+  if (!team) {
+    return h("section", {}, h("a", { class: "link-btn", href: "#/games" }, "‹ Games"),
+      h("h1", {}, "Not available"), h("p", { class: "muted" }, "This team is no longer shared with you."));
+  }
+  const games = app.shared.filter((x) => x.owner === team.uid).sort((a, b) => (a.game.date < b.game.date ? 1 : -1));
+  // Season view over their games, labelled with their squad.
   let st;
   try {
-    st = S.parseState({ players, games: [item.game] });
-  } catch (e) {
-    return h("section", {}, h("a", { class: "link-btn", href: "#/games" }, "‹ Games"), h("h1", {}, "Can't show this game"), h("p", { class: "muted" }, e.message));
+    st = S.parseState({ players: team.players ?? [], games: games.map((x) => x.game) });
+  } catch {
+    st = S.parseState({ players: team.players ?? [], games: [] });
   }
-  return viewStats(st.games[0], { st, readOnly: true, sharedBy: item.ownerName || "family" });
+  const season = S.seasonTally(st);
+  const players = S.activePlayers(st);
+  return h("section", {},
+    h("a", { class: "link-btn", href: "#/games" }, "‹ Games"),
+    h("h1", { style: "margin-bottom:4px" }, `${team.ownerName || "Family"}'s team`),
+    h("p", { class: "muted" }, "Shared with you, view only."),
+    h("h2", {}, `Games (${games.length})`),
+    games.length
+      ? h("ul", { class: "list", id: "team-games" }, games.map((x) => {
+          const sc = S.score(x.game);
+          return h("li", {},
+            h("a", { class: "main", href: `#/shared/${encodeURIComponent(x.docId)}` },
+              h("div", { class: "primary" }, `vs ${x.game.opponent}`),
+              h("div", { class: "secondary" }, fmtDate(x.game.date))),
+            h("span", { class: "badge" }, `${sc.us}–${sc.them} · ${PHASE_LABEL[S.phase(x.game)]}`));
+        }))
+      : h("p", { class: "muted" }, "No games yet."),
+    season.byPlayer.size > 0 && [h("h2", {}, "Season totals"), statsTable(season, { selectable: false, st, minutes: S.seasonPlayingTime(st) })],
+    h("h2", {}, `Squad (${players.length})`),
+    players.length
+      ? h("ul", { class: "list", id: "team-squad" }, players.map((p) => h("li", {}, h("span", { class: "shirt" }, p.number), h("div", { class: "main" }, h("div", { class: "primary" }, p.name || h("span", { class: "muted" }, "(no name)"))))))
+      : h("p", { class: "muted" }, "No players yet."));
 }
 
 // ---- Games list
+
+/** Shared games that aren't already shown under a shared team. */
+const sharedGamesOnly = () => {
+  const teams = new Set(app.sharedTeams.map((t) => t.uid));
+  return app.shared.filter((x) => !teams.has(x.owner));
+};
 
 function viewGames() {
   const st = app.state;
@@ -574,10 +635,19 @@ function viewGames() {
             h("a", { class: "link-btn", href: `#/game/${g.id}/stats` }, "Stats"));
         }))
       : h("p", { class: "muted", style: "margin-top:16px" }, "No games yet."),
-    app.shared.length > 0 && [
-      h("h2", {}, "Shared with me"),
-      h("p", { class: "muted small" }, "Games family members have shared. View only."),
-      h("ul", { class: "list", id: "shared-list" }, [...app.shared].sort((a, b) => (a.game.date < b.game.date ? 1 : -1)).map((x) => {
+    app.sharedTeams.length > 0 && [
+      h("h2", {}, "Teams shared with me"),
+      h("ul", { class: "list", id: "shared-teams" }, app.sharedTeams.map((t) => {
+        const n = app.shared.filter((x) => x.owner === t.uid).length;
+        return h("li", {},
+          h("a", { class: "main", href: `#/team/${encodeURIComponent(t.uid)}` },
+            h("div", { class: "primary" }, `${t.ownerName || "Family"}'s team`),
+            h("div", { class: "secondary" }, `${plural((t.players ?? []).filter((p) => !p.removed).length, "player")} · ${plural(n, "game")} · view only`)));
+      }))],
+    sharedGamesOnly().length > 0 && [
+      h("h2", {}, "Games shared with me"),
+      h("p", { class: "muted small" }, "Single games family members have shared. View only."),
+      h("ul", { class: "list", id: "shared-list" }, sharedGamesOnly().sort((a, b) => (a.game.date < b.game.date ? 1 : -1)).map((x) => {
         const sc = S.score(x.game);
         return h("li", {},
           h("a", { class: "main", href: `#/shared/${encodeURIComponent(x.docId)}` },
@@ -585,7 +655,9 @@ function viewGames() {
             h("div", { class: "secondary" }, `${fmtDate(x.game.date)} · by ${x.ownerName || "family"}`)),
           h("span", { class: "badge" }, `${sc.us}–${sc.them} · ${PHASE_LABEL[S.phase(x.game)]}`));
       }))],
-    season.byPlayer.size > 0 && [h("h2", {}, "Season totals"), statsTable(season, { selectable: false, minutes: S.seasonPlayingTime(st) })]);
+    season.byPlayer.size > 0 && [h("h2", {}, "Season totals"), statsTable(season, { selectable: false, minutes: S.seasonPlayingTime(st) })],
+    h("p", { class: "muted small signed-in-as" }, "Signed in as ", app.user?.email, " · ",
+      h("button", { type: "button", class: "link-btn small", id: "games-sign-out", onclick: () => cloud?.signOut() }, "Sign out")));
 }
 
 // ---- New game
@@ -1050,6 +1122,10 @@ function viewSquad() {
 
   return h("section", {},
     h("h1", {}, "Squad"),
+    h("label", { class: "share-toggle" },
+      h("input", { type: "checkbox", id: "share-team", checked: app.state.shareTeam === true, onchange: (e) => commit((st) => { st.shareTeam = e.target.checked; }) }),
+      h("span", {}, h("strong", {}, "Share my team with family"), h("br"),
+        h("span", { class: "muted small" }, "Everyone on your family list can view your squad, season stats and all your games. Only you can change them."))),
     h("p", { class: "muted small" }, "Everyone who might play, with their usual number. For each game you pick who's playing and can change numbers for that day."),
     h("form", {
       novalidate: true,
@@ -1137,7 +1213,7 @@ function viewData() {
   const file = h("input", { type: "file", accept: ".json,application/json", id: "import-file", class: "visually-hidden",
     onchange: (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) importFile(f); } });
   return h("section", {},
-    h("h1", {}, "Your data"),
+    h("h1", {}, "Account"),
     h("div", { class: "card", id: "account" },
       h("p", {}, "Signed in as ", h("strong", {}, app.user?.email), "."),
       h("p", { class: "muted small" }, cloud

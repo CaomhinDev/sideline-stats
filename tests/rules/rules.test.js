@@ -59,6 +59,16 @@ test("an unverified email is treated as a stranger", async () => {
   await assertFails(getDoc(doc(as(ME, false), "games/me_1")));
 });
 
+test("a shared team's squad is view-only for family", async () => {
+  await env.withSecurityRulesDisabled((ctx) => setDoc(doc(ctx.firestore(), "users/bro"), { players: [], shared: true }));
+  await assertSucceeds(getDoc(doc(as(ME), "users/bro")));
+  await assertFails(setDoc(doc(as(ME), "users/bro"), { players: [], shared: true }));
+  const teams = await assertSucceeds(getDocs(query(collection(as(ME), "users"), where("shared", "==", true))));
+  if (teams.size !== 1) throw new Error(`expected 1 shared team, got ${teams.size}`);
+  await assertFails(getDoc(doc(as(STRANGER), "users/bro")));
+  await assertFails(getDocs(collection(as(ME), "users"))); // can't list everyone's squads
+});
+
 test("your squad is yours alone", async () => {
   await assertSucceeds(getDoc(doc(as(ME), "users/me")));
   await assertSucceeds(setDoc(doc(as(ME), "users/me"), { players: [{ id: 1 }] }));

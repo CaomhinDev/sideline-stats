@@ -86,7 +86,7 @@ export async function isAllowed(user) {
   }
 }
 
-/** Live updates of your squad and your games. Calls back with ({ players } | null, [game], fromServer). */
+/** Live updates of your squad and your games. Calls back with ({ players, shared } | null, [game], fromServer). */
 export function watchMine(uid, cb, onError) {
   let user;
   let games;
@@ -115,18 +115,27 @@ export function watchShared(uid, cb, onError) {
   }, onError);
 }
 
+/** Live list of whole teams other family members have shared: [{ uid, ownerName, players }]. */
+export function watchSharedTeams(uid, cb, onError) {
+  return onSnapshot(query(collection(db, "users"), where("shared", "==", true)), (snap) => {
+    cb(snap.docs.filter((d) => d.id !== uid).map((d) => ({ uid: d.id, ...d.data() })));
+  }, onError);
+}
+
 // Firestore rejects undefined; a JSON round trip drops it (our data is plain JSON anyway).
 const plain = (v) => JSON.parse(JSON.stringify(v));
 
-export function saveUser(uid, { players }) {
-  return setDoc(doc(db, "users", uid), plain({ players }));
+/** Your squad. shared = your whole team is visible to family (view only). */
+export function saveUser(user, { players, shared }) {
+  return setDoc(doc(db, "users", user.uid), plain({ players, shared: shared === true, ownerName: user.name }));
 }
 
-export function saveGame(user, game, names) {
+/** shared: the game's own switch, or true when your whole team is shared. */
+export function saveGame(user, game, names, shared = game.shared === true) {
   return setDoc(doc(db, "games", `${user.uid}_${game.id}`), {
     owner: user.uid,
     ownerName: user.name,
-    shared: game.shared === true,
+    shared,
     names: plain(names),
     game: plain(game),
     updated: serverTimestamp(),

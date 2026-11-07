@@ -483,7 +483,7 @@ export function gameCSV(state, game) {
 // ---------------------------------------------------------------- export / import
 
 export function toExport(state, now = new Date()) {
-  return { format: FORMAT, version: VERSION, exportedAt: now.toISOString(), nextId: state.nextId, players: state.players, games: state.games };
+  return { format: FORMAT, version: VERSION, exportedAt: now.toISOString(), nextId: state.nextId, shareTeam: state.shareTeam === true, players: state.players, games: state.games };
 }
 
 /** Validates exported JSON (or the stored state). Throws an Error with a readable message. */
@@ -581,5 +581,6 @@ export function parseState(text) {
     });
   }
   state.nextId = Math.max(Number.isInteger(data.nextId) ? data.nextId : 1, Math.max(0, ...ids) + 1);
+  if (data.shareTeam === true) state.shareTeam = true; // family can view the squad and every game
   return state;
 }
