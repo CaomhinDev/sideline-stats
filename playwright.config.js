@@ -10,6 +10,9 @@ export default defineConfig({
   testDir: "tests/e2e",
   testMatch: remote ? /smoke\.spec\.js/ : /(app|screenshots|smoke)\.spec\.js/,
   fullyParallel: true,
+  // Several tests run two or three "phones" at once against one emulator; more
+  // than this in parallel just makes them time out.
+  workers: 4,
   // Some checks wait for a change to sync to a second "phone" through the emulator.
   expect: { timeout: 15_000 },
   reporter: [["list"]],

@@ -166,3 +166,75 @@ test("a removed coach loses editing even if still listed on a game", async () =>
   await env.withSecurityRulesDisabled((ctx) => deleteDoc(doc(ctx.firestore(), "allow/brother@example.com")));
   await assertFails(updateDoc(doc(as(BRO), "games/me_20"), { "game.events": arrayUnion({ id: 3 }) }));
 });
+
+// ---- Roles: admins, coaches, players
+
+const ADMIN = { uid: "boss", email: "boss@example.com" };
+const PLAYER = { uid: "kid", email: "kid@example.com" };
+
+async function seedRoles() {
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    const db = ctx.firestore();
+    await setDoc(doc(db, "allow/boss@example.com"), { name: "Boss", role: "admin" });
+    await setDoc(doc(db, "allow/kid@example.com"), { name: "Kid", role: "player", team: "me" });
+    await setDoc(doc(db, "allow/other-kid@example.com"), { name: "Other", role: "player", team: "bro" });
+  });
+}
+
+test("admins add and remove coaches, admins and players", async () => {
+  await seedRoles();
+  const db = as(ADMIN);
+  await assertSucceeds(setDoc(doc(db, "allow/new@example.com"), { name: "New", role: "coach" }));
+  await assertSucceeds(setDoc(doc(db, "allow/new2@example.com"), { name: "New 2", role: "admin" }));
+  await assertSucceeds(setDoc(doc(db, "allow/p@example.com"), { name: "P", role: "player", team: "me" }));
+  await assertSucceeds(updateDoc(doc(db, "allow/new@example.com"), { role: "admin" }));
+  await assertSucceeds(deleteDoc(doc(db, "allow/new@example.com")));
+  // Not themselves: no self-removal or self-demotion.
+  await assertFails(deleteDoc(doc(db, "allow/boss@example.com")));
+  await assertFails(updateDoc(doc(db, "allow/boss@example.com"), { role: "coach" }));
+  // Entries must be well formed.
+  await assertFails(setDoc(doc(db, "allow/bad@example.com"), { role: "superuser" }));
+  await assertFails(setDoc(doc(db, "allow/bad@example.com"), { role: "player" })); // no team
+  await assertFails(setDoc(doc(db, "allow/Upper@Example.com"), { role: "coach" }));
+  await assertFails(setDoc(doc(db, "allow/bad@example.com"), { role: "coach", extra: 1 }));
+});
+
+test("coaches add and remove only their own players", async () => {
+  await seedRoles();
+  const db = as(ME);
+  await assertSucceeds(setDoc(doc(db, "allow/mine@example.com"), { name: "Mine", role: "player", team: "me" }));
+  await assertSucceeds(updateDoc(doc(db, "allow/mine@example.com"), { name: "Renamed" }));
+  await assertSucceeds(deleteDoc(doc(db, "allow/kid@example.com")));
+  await assertFails(setDoc(doc(db, "allow/theirs@example.com"), { role: "player", team: "bro" }));
+  await assertFails(setDoc(doc(db, "allow/coach2@example.com"), { role: "coach" }));
+  await assertFails(deleteDoc(doc(db, "allow/other-kid@example.com")));
+  await assertFails(deleteDoc(doc(db, "allow/brother@example.com"))); // a coach
+  await assertFails(updateDoc(doc(db, "allow/other-kid@example.com"), { team: "me" }));
+});
+
+test("a player sees their team's games and squad, nothing else, and can't change anything", async () => {
+  await seedRoles();
+  const db = as(PLAYER);
+  await assertSucceeds(getDoc(doc(db, "games/me_1"))); // unshared, but their team's
+  await assertSucceeds(getDoc(doc(db, "users/me")));
+  const list = await assertSucceeds(getDocs(query(collection(db, "games"), where("owner", "==", "me"))));
+  if (list.size !== 2) throw new Error(`expected 2 team games, got ${list.size}`);
+  await assertFails(getDoc(doc(db, "games/bro_3"))); // another team's, even though shared
+  await assertFails(getDocs(query(collection(db, "games"), where("shared", "==", true))));
+  await assertFails(getDocs(collection(db, "allow")));
+  await assertFails(getDoc(doc(db, "allow/me@example.com")));
+  await assertSucceeds(getDoc(doc(db, "allow/kid@example.com"))); // their own entry
+  await assertFails(updateDoc(doc(db, "games/me_1"), { "game.opponent": "x" }));
+  await assertFails(setDoc(doc(db, "games/kid_9"), { owner: "kid", shared: false, game: {} }));
+  await assertFails(setDoc(doc(db, "users/kid"), { players: [] }));
+  await assertFails(setDoc(doc(db, "users/me"), { players: [] }));
+  await assertFails(setDoc(doc(db, "allow/friend@example.com"), { role: "player", team: "me" }));
+  await assertFails(updateDoc(doc(db, "allow/kid@example.com"), { role: "coach" }));
+});
+
+test("a player listed as a game editor still can't edit", async () => {
+  await seedRoles();
+  await env.withSecurityRulesDisabled((ctx) =>
+    setDoc(doc(ctx.firestore(), "games/me_30"), { owner: "me", shared: false, editors: ["kid@example.com"], game: { id: 30 } }));
+  await assertFails(updateDoc(doc(as(PLAYER), "games/me_30"), { "game.events": arrayUnion({ id: 1 }) }));
+});

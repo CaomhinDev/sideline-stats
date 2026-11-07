@@ -73,17 +73,49 @@ export async function testSignIn(email) {
 }
 
 /**
- * Is this account on the coaches allowlist? Returns true/false, or null when it
- * can't be checked (offline with nothing cached).
+ * This account's access: { role: "admin" | "coach" | "player", team } when it's on
+ * the list, false when it isn't, or null when it can't be checked (offline).
  */
-export async function isAllowed(user) {
+export async function getAccess(user) {
   try {
     const snap = await getDoc(doc(db, "allow", user.email));
-    return snap.exists();
+    if (!snap.exists()) return false;
+    const d = snap.data();
+    const role = ["admin", "coach", "player"].includes(d.role) ? d.role : "coach";
+    return { role, team: role === "player" ? String(d.team ?? "") : null };
   } catch (e) {
     if (e?.code === "permission-denied") return false;
     return null;
   }
+}
+
+export async function isAllowed(user) {
+  const a = await getAccess(user);
+  return a === null ? null : a !== false;
+}
+
+/** Adds (or replaces) someone on the list. Email is stored lowercase. */
+export function addPerson(email, { name, role, team }, addedBy) {
+  const entry = { name: String(name ?? "").trim().slice(0, 60), role };
+  if (role === "player") entry.team = team;
+  if (addedBy) entry.addedBy = addedBy;
+  return setDoc(doc(db, "allow", email.trim().toLowerCase()), entry);
+}
+
+export const setRole = (email, role) => updateDoc(doc(db, "allow", email), { role });
+export const removePerson = (email) => deleteDoc(doc(db, "allow", email));
+
+/** For a player: their team's squad doc and games, live. cb(team | null, games). */
+export function watchTeam(teamUid, cb, onError) {
+  let team;
+  let games;
+  const emit = () => { if (team !== undefined && games !== undefined) cb(team, games); };
+  const u1 = onSnapshot(doc(db, "users", teamUid), (snap) => { team = snap.exists() ? snap.data() : null; emit(); }, onError);
+  const u2 = onSnapshot(query(collection(db, "games"), where("owner", "==", teamUid)), (snap) => {
+    games = snap.docs.map((d) => ({ docId: d.id, ...d.data() }));
+    emit();
+  }, onError);
+  return () => { u1(); u2(); };
 }
 
 /** Live updates of your squad and your games. Calls back with ({ players, shared } | null, [game], fromServer). */
@@ -126,8 +158,8 @@ export function watchSharedTeams(uid, cb, onError) {
 const plain = (v) => JSON.parse(JSON.stringify(v));
 
 /** Your squad. shared = your whole team is visible to every coach (view only). */
-export function saveUser(user, { players, shared }) {
-  return setDoc(doc(db, "users", user.uid), plain({ players, shared: shared === true, ownerName: user.name }));
+export function saveUser(user, { players, shared, teamName }) {
+  return setDoc(doc(db, "users", user.uid), plain({ players, shared: shared === true, ownerName: user.name, teamName: teamName ?? "" }));
 }
 
 export const gameDocId = (uid, gameId) => `${uid}_${gameId}`;
@@ -157,10 +189,14 @@ export const add = (items) => arrayUnion(...plain(items));
 export const remove = (items) => arrayRemove(...plain(items));
 export const unset = () => deleteField();
 
-/** Live list of coaches on the allowlist: [{ email, name }]. */
-export function watchCoaches(cb, onError) {
+/** Live list of everyone on the allowlist: [{ email, name, role, team }] (coaches and admins only can read it). */
+export function watchPeople(cb, onError) {
   return onSnapshot(collection(db, "allow"), (snap) => {
-    cb(snap.docs.map((d) => ({ email: d.id, name: String(d.data().name ?? "") })).sort((a, b) => a.email.localeCompare(b.email)));
+    cb(snap.docs.map((d) => {
+      const x = d.data();
+      const role = ["admin", "coach", "player"].includes(x.role) ? x.role : "coach";
+      return { email: d.id, name: String(x.name ?? ""), role, team: x.team ?? null };
+    }).sort((a, b) => (a.name || a.email).localeCompare(b.name || b.email)));
   }, onError);
 }
 

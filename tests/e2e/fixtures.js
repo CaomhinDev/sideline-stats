@@ -4,14 +4,16 @@ import { test as base, expect } from "@playwright/test";
 
 export const FIRESTORE = "http://127.0.0.1:8085/v1/projects/demo-sideline/databases/(default)/documents";
 
-/** Adds an email to the family allowlist (as the console would, bypassing rules). */
-export async function allow(email) {
+/** Adds an email to the allowlist (as the console would, bypassing rules). fields: e.g. { role: "admin" }. */
+export async function allow(email, fields = {}) {
+  const body = { fields: Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, { stringValue: String(v) }])) };
   const res = await fetch(`${FIRESTORE}/allow/${encodeURIComponent(email.toLowerCase())}`, {
-    method: "PATCH", headers: { Authorization: "Bearer owner", "Content-Type": "application/json" }, body: JSON.stringify({ fields: {} }),
+    method: "PATCH", headers: { Authorization: "Bearer owner", "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`allowlist seed failed: ${res.status} ${await res.text()}`);
 }
 
+/** The uid the auth emulator gives an email signed in via signInAs (sub is derived from the email). */
 export const freshEmail = (tag = "coach") => `${tag}-${Date.now()}-${Math.floor(Math.random() * 1e6)}@example.com`;
 
 /** Signs the page in as email (emulator Google sign-in) and waits for the app to open. */

@@ -3,26 +3,39 @@
 export const FORMAT = "sideline-stats";
 // 2: per-game rosters and shirt numbers on events; 3: lineups, subs, goals conceded;
 // 4: events can belong to the opposition (team "them"), replacing the separate conceded list.
-export const VERSION = 4;
+export const VERSION = 5; // 5: team name, possession, clock pauses, new event list
 
 /**
  * What can happen. Ids are stored in saved data, so never rename them; labels are free to change.
  * group drives colour (defending / aerial / attacking), shape tells types apart, positive=false draws hollow.
  */
 export const EVENT_TYPES = [
-  // Good for the team
-  { id: "tackle_won", label: "Tackle won", short: "Tkl", group: 0, shape: "circle", positive: true },
-  { id: "broken_won", label: "Broken ball won", short: "BB W", group: 0, shape: "hexagon", positive: true },
-  { id: "air_won", label: "Header won", short: "Hdr W", group: 1, shape: "triangle", positive: true },
-  { id: "save", label: "Save", short: "Save", group: 1, shape: "diamond", positive: true },
-  { id: "shot_on", label: "Shot on target", short: "On T", group: 2, shape: "square", positive: true },
-  { id: "goal", label: "Goal", short: "Goal", group: 2, shape: "star", positive: true },
-  // Bad for the team
-  { id: "broken_lost", label: "Broken ball lost", short: "BB L", group: 0, shape: "hexagon", positive: false },
-  { id: "air_lost", label: "Header lost", short: "Hdr L", group: 1, shape: "triangle", positive: false },
-  { id: "shot_off", label: "Shot off target", short: "Off T", group: 2, shape: "square", positive: false },
-  { id: "yellow", label: "Yellow card", short: "YC", group: 3, shape: "card", positive: false },
+  // Attack, alphabetical
+  { id: "assist", label: "Assist", short: "Ast", side: "attack", group: 2, shape: "triangle", positive: true },
+  { id: "cross", label: "Cross", short: "Crs", side: "attack", group: 2, shape: "tri-down", positive: true },
+  { id: "goal", label: "Goal", short: "Goal", side: "attack", group: 2, shape: "star", positive: true },
+  { id: "pass", label: "Pass", short: "Pass", side: "attack", group: 2, shape: "circle", positive: true },
+  { id: "shot", label: "Shot", short: "Shot", side: "attack", group: 2, shape: "diamond", positive: true },
+  { id: "shot_off", label: "Shot off target", short: "Off T", side: "attack", group: 2, shape: "square", positive: false },
+  { id: "shot_on", label: "Shot on target", short: "On T", side: "attack", group: 2, shape: "square", positive: true },
+  { id: "throw_in", label: "Throw in", short: "Thr", side: "attack", group: 2, shape: "hexagon", positive: true },
+  // Defend, alphabetical
+  { id: "broken_lost", label: "Broken ball lost", short: "BB L", side: "defend", group: 0, shape: "hexagon", positive: false },
+  { id: "broken_won", label: "Broken ball won", short: "BB W", side: "defend", group: 0, shape: "hexagon", positive: true },
+  { id: "clearance", label: "Clearance", short: "Clr", side: "defend", group: 0, shape: "tri-down", positive: true },
+  { id: "foul", label: "Foul", short: "Foul", side: "defend", group: 1, shape: "square", positive: false },
+  { id: "air_won", label: "Header won", short: "Hdr", side: "defend", group: 0, shape: "triangle", positive: true },
+  { id: "interception", label: "Interception", short: "Int", side: "defend", group: 0, shape: "diamond", positive: true },
+  { id: "tackle_won", label: "Tackle", short: "Tkl", side: "defend", group: 0, shape: "circle", positive: true },
+  { id: "yellow", label: "Yellow card", short: "YC", side: "defend", group: 3, shape: "card", positive: false },
+  // Retired: no longer offered, but older games keep them.
+  { id: "save", label: "Save", short: "Save", side: "defend", group: 0, shape: "diamond", positive: true, retired: true },
+  { id: "air_lost", label: "Header lost", short: "Hdr L", side: "defend", group: 0, shape: "triangle", positive: false, retired: true },
 ];
+/** The buttons offered, per side. */
+export const eventButtons = (side) => EVENT_TYPES.filter((t) => t.side === side && !t.retired);
+/** Event types to show in stats: current ones, plus retired ones that were used. */
+export const statTypes = (events) => EVENT_TYPES.filter((t) => !t.retired || events.some((e) => e.type === t.id));
 export const EVENT_IDS = EVENT_TYPES.map((t) => t.id);
 export const eventType = (id) => EVENT_TYPES.find((t) => t.id === id);
 
@@ -36,6 +49,19 @@ export function newId(state, now = Date.now()) {
   state.nextId = id + 1;
   return id;
 }
+
+export const TEAM_NAME_MAX = 40;
+
+/** Returns an error message, or null if the team name is fine. */
+export function teamNameError(name) {
+  const n = String(name ?? "").trim();
+  if (!n) return "Enter your team's name";
+  if (n.length > TEAM_NAME_MAX) return `Keep it under ${TEAM_NAME_MAX} characters`;
+  return null;
+}
+
+/** "Ballyhale U12 vs Rovers": your team's name as recorded on the game, else your current one. */
+export const matchTitle = (game, teamName) => `${game.team || teamName || "Us"} vs ${game.opponent}`;
 
 export function emptyState() {
   return { nextId: 1, players: [], games: [] };
@@ -215,6 +241,7 @@ export function createGame(state, { opponent, date, halfLength, roster }) {
     opponent: name.slice(0, 60),
     date: isValidISODate(date) ? date : todayISO(),
     halfLength: len,
+    ...(state.teamName ? { team: state.teamName } : {}),
     roster: sheet.roster,
     starting: [], // on the pitch at kick-off
     subs: [], // { id, half, t, on: [ids], off: [ids] }, t in clock seconds like events
@@ -263,19 +290,76 @@ export const NEXT_ACTION = {
 export function advancePhase(game, now = Date.now()) {
   switch (phase(game)) {
     case "pre": game.periods.push({ start: now, end: null }); break;
-    case "first": game.periods[0].end = now; break;
+    case "first": endPeriod(game.periods[0], now); break;
     case "half": game.periods.push({ start: now, end: null }); break;
-    case "second": game.periods[1].end = now; break;
+    case "second": endPeriod(game.periods[1], now); break;
   }
   return phase(game);
+}
+
+function endPeriod(period, now) {
+  period.end = now;
+  const open = period.pauses?.at(-1);
+  if (open && open.to == null) open.to = now;
+}
+
+/** Seconds played in a half: wall time since its start, less any pauses. */
+export function halfElapsed(period, now = Date.now()) {
+  if (!period) return 0;
+  const end = period.end ?? now;
+  const paused = (period.pauses ?? []).reduce((ms, p) => ms + Math.max(0, Math.min(p.to ?? end, end) - p.from), 0);
+  return Math.max(0, Math.floor((end - period.start - paused) / 1000));
+}
+
+const livePeriod = (game) => {
+  const p = phase(game);
+  return p === "first" ? game.periods[0] : p === "second" ? game.periods[1] : null;
+};
+
+export const isPaused = (game) => {
+  const last = livePeriod(game)?.pauses?.at(-1);
+  return !!last && last.to == null;
+};
+
+/** Stops the clock mid-half (injury, misclick). Returns false if no half is running. */
+export function pauseClock(game, now = Date.now()) {
+  const period = livePeriod(game);
+  if (!period || isPaused(game)) return false;
+  (period.pauses ??= []).push({ from: now, to: null });
+  return true;
+}
+
+export function resumeClock(game, now = Date.now()) {
+  if (!isPaused(game)) return false;
+  livePeriod(game).pauses.at(-1).to = now;
+  return true;
+}
+
+/**
+ * Restarts the running (or paused) half from 0:00 (or the half length, in the
+ * 2nd half). Events already logged keep their times. Returns the old period, for undo.
+ */
+export function restartHalf(game, now = Date.now()) {
+  const period = livePeriod(game);
+  if (!period) return null;
+  const old = { ...period, pauses: period.pauses?.map((p) => ({ ...p })) };
+  period.start = now;
+  delete period.pauses;
+  return old;
 }
 
 /** Reverses the last phase change (e.g. Full time pressed by mistake). */
 export function undoPhase(game) {
   const last = game.periods.at(-1);
   if (!last) return;
-  if (last.end != null) last.end = null;
-  else game.periods.pop();
+  if (last.end != null) {
+    // Reopen the half; a pause that the half's end closed is open again.
+    const pause = last.pauses?.at(-1);
+    if (pause && pause.to === last.end) pause.to = null;
+    last.end = null;
+  } else {
+    game.periods.pop();
+  }
 }
 
 /**
@@ -286,9 +370,10 @@ export function clock(game, now = Date.now()) {
   const p = phase(game);
   const half = p === "second" || p === "full" ? 2 : 1;
   const period = game.periods[half - 1];
-  const inHalf = period ? Math.max(0, Math.floor(((period.end ?? now) - period.start) / 1000)) : 0;
-  const seconds = (half === 2 ? game.halfLength * 60 : 0) + inHalf;
-  return { phase: p, half, seconds, running: p === "first" || p === "second" };
+  const seconds = (half === 2 ? game.halfLength * 60 : 0) + halfElapsed(period, now);
+  const live = p === "first" || p === "second";
+  const paused = live && isPaused(game);
+  return { phase: p, half, seconds, running: live && !paused, paused };
 }
 
 export function formatClock(seconds) {
@@ -389,7 +474,7 @@ export function playingTime(game, now = Date.now()) {
     // Half-time subs (half 2, at its first second) are applied as the 2nd half starts.
     const start = (half - 1) * game.halfLength * 60;
     if (!period) break;
-    const end = start + Math.max(0, Math.floor(((period.end ?? now) - period.start) / 1000));
+    const end = start + halfElapsed(period, now);
     let from = start;
     const credit = (to) => { for (const id of on) secs.set(id, (secs.get(id) ?? 0) + Math.max(0, to - from)); };
     while (i < subs.length && subs[i].half === half) {
@@ -406,6 +491,59 @@ export function playingTime(game, now = Date.now()) {
 }
 
 export const formatMinutes = (seconds) => `${Math.floor((seconds ?? 0) / 60)}'`;
+
+// ---------------------------------------------------------------- possession
+
+/** Who has the ball now: "us" | "them" | null (unknown, or out of play). Resets each half. */
+export function possessionNow(game) {
+  const c = clock(game);
+  const changes = (game.possession ?? []).filter((x) => x.half === c.half).sort((a, b) => a.t - b.t || a.id - b.id);
+  return changes.at(-1)?.team ?? null;
+}
+
+/** Records a change of possession at the current clock time. team null = nobody (ball out). */
+export function setPossession(state, game, team, now = Date.now()) {
+  if (team !== "us" && team !== "them" && team !== null) throw new Error(`Unknown team ${team}`);
+  const c = clock(game, now);
+  const change = { id: newId(state), half: c.half, t: c.seconds, team };
+  (game.possession ??= []).push(change);
+  return change;
+}
+
+export function deletePossession(game, id) {
+  game.possession = (game.possession ?? []).filter((x) => x.id !== id);
+}
+
+/**
+ * Seconds of possession per team: { us, them, half: { 1: {us, them}, 2: {us, them} } }.
+ * Counted from each change to the next, within the time actually played.
+ */
+export function possessionTime(game, now = Date.now()) {
+  const total = { us: 0, them: 0, half: { 1: { us: 0, them: 0 }, 2: { us: 0, them: 0 } } };
+  for (const half of [1, 2]) {
+    const period = game.periods[half - 1];
+    if (!period) break;
+    const start = (half - 1) * game.halfLength * 60;
+    const end = start + halfElapsed(period, now);
+    const changes = (game.possession ?? []).filter((x) => x.half === half).sort((a, b) => a.t - b.t || a.id - b.id);
+    changes.forEach((x, i) => {
+      if (!x.team) return;
+      const from = Math.min(Math.max(x.t, start), end);
+      const to = Math.min(Math.max(changes[i + 1]?.t ?? end, from), end);
+      total[x.team] += to - from;
+      total.half[half][x.team] += to - from;
+    });
+  }
+  return total;
+}
+
+/** Possession as whole percentages { us, them }, or null when none was recorded. */
+export function possessionPercent(t) {
+  const sum = t.us + t.them;
+  if (!sum) return null;
+  const us = Math.round((t.us / sum) * 100);
+  return { us, them: 100 - us };
+}
 
 // ---------------------------------------------------------------- score
 
@@ -489,7 +627,10 @@ export function gameCSV(state, game) {
   for (const it of items) rows.push([minuteLabel(it, game.halfLength), it.half, formatClock(it.t), ...it.row]);
   const { us, them } = score(game);
   const mins = playingTime(game);
-  rows.push([], ["Score", `${us}-${them}`], [], ["Number", "Player", "Minutes played"]);
+  const pos = possessionPercent(possessionTime(game));
+  rows.push([], ["Score", `${us}-${them}`]);
+  if (pos) rows.push(["Possession", `${pos.us}%-${pos.them}%`]);
+  rows.push([], ["Number", "Player", "Minutes played"]);
   for (const r of game.roster) rows.push([r.number, name(r.playerId), Math.floor((mins.get(r.playerId) ?? 0) / 60)]);
   return rows.map((r) => r.map(csvCell).join(",")).join("\n") + "\n";
 }
@@ -497,7 +638,7 @@ export function gameCSV(state, game) {
 // ---------------------------------------------------------------- export / import
 
 export function toExport(state, now = new Date()) {
-  return { format: FORMAT, version: VERSION, exportedAt: now.toISOString(), nextId: state.nextId, shareTeam: state.shareTeam === true, players: state.players, games: state.games };
+  return { format: FORMAT, version: VERSION, exportedAt: now.toISOString(), nextId: state.nextId, teamName: state.teamName ?? "", shareTeam: state.shareTeam === true, players: state.players, games: state.games };
 }
 
 /** Validates exported JSON (or the stored state). Throws an Error with a readable message. */
@@ -534,7 +675,14 @@ export function parseState(text) {
     if (!Array.isArray(g.periods) || g.periods.length > 2) throw new Error(`Game ${g.id} has invalid halves.`);
     const periods = g.periods.map((p) => {
       if (!Number.isFinite(p?.start) || !(p.end == null || (Number.isFinite(p.end) && p.end >= p.start))) throw new Error(`Game ${g.id} has invalid half times.`);
-      return { start: p.start, end: p.end ?? null };
+      const out = { start: p.start, end: p.end ?? null };
+      if (Array.isArray(p.pauses) && p.pauses.length) {
+        out.pauses = p.pauses.map((x) => {
+          if (!Number.isFinite(x?.from) || !(x.to == null || Number.isFinite(x.to))) throw new Error(`Game ${g.id} has an invalid pause.`);
+          return { from: x.from, to: x.to ?? null };
+        });
+      }
+      return out;
     });
     if (periods[0]?.end == null && periods.length === 2) throw new Error(`Game ${g.id} has invalid half times.`);
     const events = (g.events ?? []).map((e) => {
@@ -576,6 +724,10 @@ export function parseState(text) {
       return { id: x.id, half: x.half, t: Math.floor(x.t) };
     };
     const subs = (g.subs ?? []).map((x) => ({ ...timed(x, "substitution"), on: known(x.on, "substitution"), off: known(x.off, "substitution") }));
+    const possession = (g.possession ?? []).map((x) => {
+      if (x?.team !== "us" && x?.team !== "them" && x?.team !== null) throw new Error(`Game ${g.id} has an invalid possession change.`);
+      return { ...timed(x, "possession change"), team: x.team };
+    });
     // Version 3 kept goals conceded in their own list; they're now opposition Goal events.
     for (const x of g.conceded ?? []) {
       const c = timed(x, "goal conceded");
@@ -586,6 +738,7 @@ export function parseState(text) {
       opponent: g.opponent.trim(),
       date: isValidISODate(g.date) ? g.date : todayISO(),
       halfLength: g.halfLength,
+      ...(typeof g.team === "string" && g.team.trim() ? { team: g.team.trim().slice(0, TEAM_NAME_MAX) } : {}),
       roster: checked.roster,
       ...(g.shared === true ? { shared: true } : {}),
       // Coaches (lowercase emails) who may edit this game alongside its creator.
@@ -594,11 +747,13 @@ export function parseState(text) {
         : {}),
       starting: known(g.starting, "starting lineup"),
       subs,
+      ...(possession.length ? { possession } : {}),
       periods,
       events,
     });
   }
   state.nextId = Math.max(Number.isInteger(data.nextId) ? data.nextId : 1, Math.max(0, ...ids) + 1);
   if (data.shareTeam === true) state.shareTeam = true; // every coach can view the squad and every game
+  if (typeof data.teamName === "string" && data.teamName.trim()) state.teamName = data.teamName.trim().slice(0, TEAM_NAME_MAX);
   return state;
 }

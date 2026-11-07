@@ -25,6 +25,7 @@
   --good-soft: #e3f2e7;
   --bad-soft: #fbe7e5;
   --bad-edge: #c9827c;
+  --def-soft: #e4ecf8;
   --radius: 12px;
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
@@ -38,7 +39,7 @@
     --danger: #f2b8b5; --warn-bg: #3d3100; --warn-text: #ffe08a;
     --grass: #24603a; --grass-2: #205735;
     --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
-    --good-soft: #1b2d20; --bad-soft: #35201e; --bad-edge: #8a4a44;
+    --good-soft: #1b2d20; --bad-soft: #35201e; --bad-edge: #8a4a44; --def-soft: #1c2533;
   }
 }
 :root[data-theme="dark"] {
@@ -50,7 +51,7 @@
   --danger: #f2b8b5; --warn-bg: #3d3100; --warn-text: #ffe08a;
   --grass: #24603a; --grass-2: #205735;
   --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
-    --good-soft: #1b2d20; --bad-soft: #35201e; --bad-edge: #8a4a44;
+    --good-soft: #1b2d20; --bad-soft: #35201e; --bad-edge: #8a4a44; --def-soft: #1c2533;
 }
 
 * { box-sizing: border-box; }
@@ -77,7 +78,7 @@ p { margin: 0 0 12px; }
 @media (max-width: 760px) { .banner { margin: 8px 16px 0; } }
 
 .tabs {
-  position: fixed; inset: auto 0 0 0; display: grid; grid-template-columns: repeat(4, 1fr);
+  position: fixed; inset: auto 0 0 0; display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
   background: var(--surface); border-top: 1px solid var(--border); padding-bottom: env(safe-area-inset-bottom);
 }
 .tabs a { text-align: center; text-decoration: none; color: var(--text-2); font-weight: 600; padding: 18px 4px; }
@@ -142,12 +143,12 @@ body.live main { padding-top: 6px; }
 .pitch-wrap { position: relative; margin: 0 0 8px; }
 .live-status {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  min-height: 34px; margin: 0 0 6px; padding: 0 4px 0 10px; border-radius: 10px;
+  min-height: 30px; margin: 0 0 4px; padding: 0 4px 0 10px; border-radius: 10px;
   background: var(--surface-2); font-size: 0.9rem; font-weight: 600;
 }
 .live-status .msg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .live-status .undo { appearance: none; border: 0; background: none; color: var(--selected); font: inherit; font-weight: 800; text-decoration: underline; padding: 8px 10px; cursor: pointer; flex: none; }
-.pitch { display: block; width: 100%; height: auto; max-height: 27vh; margin: 0 auto; border-radius: 10px; touch-action: manipulation; cursor: crosshair; }
+.pitch { display: block; width: 100%; height: auto; max-height: 22vh; margin: 0 auto; border-radius: 10px; touch-action: manipulation; cursor: crosshair; }
 .pitch .grass { fill: var(--grass); }
 .pitch .stripe { fill: var(--grass-2); }
 .pitch .line { fill: none; stroke: var(--pitch-line); stroke-width: 0.5; }
@@ -160,28 +161,29 @@ body.live main { padding-top: 6px; }
 .step h2 { margin: 0; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-2); }
 .step .done { color: var(--accent); }
 
-/* Event buttons in two tinted blocks: good for the team (3×2), bad for the team (4×1). */
-.events { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin-bottom: 6px; padding: 4px; border-radius: 12px; }
-.events.good { background: var(--good-soft); }
-.events.bad { background: var(--bad-soft); grid-template-columns: repeat(4, 1fr); }
-.events.bad .ev-btn { flex-direction: column; justify-content: center; gap: 2px; padding: 4px 2px; text-align: center; font-size: 0.78rem; }
+/* Event buttons: an Attack block and a Defend block, 4×2 each, with a side label. */
+.events { display: grid; grid-template-columns: 16px repeat(4, 1fr); grid-template-rows: repeat(2, auto); gap: 4px; margin-bottom: 5px; padding: 4px; border-radius: 12px; }
+.events.attack { background: var(--good-soft); }
+.events.defend { background: var(--def-soft); }
+.events .side-label { grid-row: 1 / span 2; writing-mode: vertical-rl; transform: rotate(180deg); text-align: center; font-size: 0.68rem; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-2); }
+.events .ev-btn { flex-direction: column; justify-content: center; gap: 1px; padding: 3px 2px; text-align: center; font-size: 0.74rem; line-height: 1.08; }
 .events .ev-btn[data-event="goal"] { font-size: 1.05rem; }
 .ev-btn, .pl-btn {
   appearance: none; font: inherit; color: var(--text); background: var(--surface);
   border: 2px solid var(--border); border-radius: 12px; cursor: pointer; touch-action: manipulation;
 }
-.ev-btn { display: flex; align-items: center; gap: 6px; padding: 4px 6px; min-height: 48px; font-weight: 700; font-size: 0.84rem; line-height: 1.1; text-align: left; }
+.ev-btn { display: flex; align-items: center; gap: 6px; padding: 4px 6px; min-height: 48px; font-weight: 700; font-size: 0.84rem; line-height: 1.1; text-align: left; overflow-wrap: break-word; hyphens: auto; }
 .clock-line { display: flex; align-items: baseline; gap: 8px; }
 .opp-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .opp-line .opp { min-width: 0; }
 .opp-line .badge { flex: none; }
 .ev-btn svg { flex: none; }
 .ev-btn[aria-pressed="true"], .pl-btn[aria-pressed="true"] { border-color: var(--selected); background: var(--selected-soft); box-shadow: 0 0 0 2px var(--selected) inset; }
-.players { display: grid; grid-template-columns: repeat(auto-fill, minmax(62px, 1fr)); gap: 6px; margin-bottom: 10px; }
+.players { display: grid; grid-template-columns: repeat(auto-fill, minmax(56px, 1fr)); gap: 4px; margin-bottom: 8px; }
 .pl-btn { min-height: 48px; padding: 4px; display: grid; place-items: center; align-content: center; }
 .pl-btn.bench { opacity: 0.45; border-style: dashed; }
-.pl-btn.them { border-color: var(--bad-edge); background: var(--bad-soft); grid-column: span 2; }
-.pl-btn.them .n { font-size: 1.05rem; }
+.pl-btn.them { border-color: var(--bad-edge); background: var(--bad-soft); }
+.pl-btn.them .n { font-size: 0.92rem; }
 .pl-btn .n { font-size: 1.3rem; font-weight: 800; line-height: 1.1; font-variant-numeric: tabular-nums; }
 .pl-btn .nm { font-size: 0.72rem; color: var(--text-2); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ev-btn:active, .pl-btn:active { transform: scale(0.97); }
@@ -284,3 +286,57 @@ code { font-family: ui-monospace, monospace; font-size: 0.9em; background: var(-
 .help .tip { color: var(--text-2); font-size: 0.9rem; }
 .link-btn.more { font-size: 1.4rem; line-height: 1; padding: 6px 12px; font-weight: 800; }
 .menu { display: grid; gap: 8px; }
+
+/* Possession: who has the ball */
+.possession { display: grid; grid-template-columns: 1fr auto 1fr; gap: 6px; align-items: center; margin-bottom: 4px; }
+.poss-btn { appearance: none; font: inherit; font-weight: 700; font-size: 0.85rem; min-height: 40px; border-radius: 10px; border: 2px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; touch-action: manipulation; }
+.poss-btn.us[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.poss-btn.them[aria-pressed="true"] { background: var(--bad-edge); border-color: var(--bad-edge); color: #fff; }
+.poss-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.poss-pct { font-size: 0.8rem; font-weight: 700; color: var(--text-2); font-variant-numeric: tabular-nums; min-width: 84px; text-align: center; }
+.poss-card { padding: 12px; }
+.poss-meter { display: flex; height: 26px; border-radius: 8px; overflow: hidden; font-size: 0.8rem; font-weight: 800; }
+.poss-meter span { display: grid; place-items: center; min-width: 2.5em; }
+.poss-meter .us { background: var(--accent); color: var(--accent-text); }
+.poss-meter .them { background: var(--bad-edge); color: #fff; }
+
+/* Clock button and paused state */
+.clock-btn { appearance: none; border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 8px; font: inherit; font-size: 0.9rem; min-width: 40px; min-height: 34px; cursor: pointer; align-self: center; }
+.clock-btn:disabled { opacity: 0.4; }
+.clock.paused { color: var(--text-3); animation: blink 1.4s steps(2, start) infinite; }
+@keyframes blink { to { visibility: hidden; } }
+@media (prefers-reduced-motion: reduce) { .clock.paused { animation: none; } }
+
+/* Substitutions */
+.subs h3.sub-step { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; margin: 12px 0 6px; color: var(--text-2); }
+.subs h3.sub-step.off::before { content: "● "; color: var(--danger); }
+.subs h3.sub-step.on::before { content: "● "; color: var(--accent); }
+.sub-chip.picked.off { border-color: var(--danger); background: var(--bad-soft); }
+.sub-chip.picked.on, .sub-chip.picked.start { border-color: var(--accent); background: var(--good-soft); }
+.sub-chip.picked .mins { color: var(--text); font-weight: 800; }
+.sub-summary { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; font-size: 0.9rem; }
+.sub-summary .tag { font-weight: 700; padding: 1px 6px; border-radius: 6px; }
+.sub-summary .tag.off { background: var(--bad-soft); }
+.sub-summary .tag.on { background: var(--good-soft); }
+.team-name { margin-bottom: 12px; }
+dialog { max-height: 90vh; overflow-y: auto; }
+.help-table td, .help-table th { white-space: normal; }
+.help-table td:first-child { font-weight: 700; white-space: nowrap; }
+.live-head .opp { display: flex; min-width: 0; white-space: nowrap; }
+.live-head .opp .us-name { overflow: hidden; text-overflow: ellipsis; min-width: 2.5em; }
+.live-head .opp .vs-name { flex: none; }
+.clock-btn { display: inline-grid; place-items: center; }
+.live-title { display: flex; align-items: center; gap: 6px; min-width: 0; padding-top: 2px; }
+.live-title .back { font-size: 1.3rem; padding: 0 6px 0 0; line-height: 1; text-decoration: none; color: var(--text); }
+.live-title .opp { font-weight: 700; font-size: 0.95rem; display: flex; min-width: 0; white-space: nowrap; }
+.live-title .opp .us-name { overflow: hidden; text-overflow: ellipsis; min-width: 2.5em; }
+.live-title .opp .vs-name { flex: none; }
+.live-head .score { font-size: 1.25rem; padding: 2px 10px; }
+.live-head { padding-top: 0; }
+.live-title .opp .vs-name { white-space: pre; }
+.live-head .phase-label { white-space: nowrap; }
+.live-head .title { min-width: 0; }
+.live-head .clock-line { align-items: center; gap: 8px; }
+.live-head .clock-stack { display: grid; line-height: 1.05; }
+.live-head .clock-stack .phase-label { font-size: 0.75rem; }
+.live-head .phase-btn { padding: 8px 12px; font-size: 0.95rem; }

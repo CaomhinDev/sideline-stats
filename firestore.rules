@@ -1,14 +1,20 @@
 rules_version = '2';
 
 // Sideline Stats access rules.
-// - Only Google accounts listed in /allow/{email} (the coaches) can use the app at
-//   all. The list is managed in the Firebase console; coaches can see it but the
-//   app can never change it.
-// - Your squad lives in /users/{uid}; only you can change it. If you share your
-//   team, every coach can view it (and all your games are shared).
-// - Each game is /games/{uid}_{id}. Its creator controls it. If marked shared,
-//   every coach can view it. Coaches listed in its `editors` can also edit the
-//   game itself (events, clock, subs), but not who can edit, sharing, or delete.
+//
+// People: /allow/{email} lists everyone who can sign in, with a role:
+//   admin  – a coach who can also add/remove coaches and admins
+//   coach  – (or no role, for older entries) uses the app fully
+//   player – can only view the games and stats of the team (coach) that added them
+// Admins manage coaches and admins; any coach can add/remove their own players.
+//
+// Your squad lives in /users/{uid}; only you can change it. If you share your
+// team, every coach can view it; your own players can always view it.
+//
+// Each game is /games/{uid}_{id}. Its creator controls it. If marked shared,
+// every coach can view it. Coaches listed in its `editors` can edit the game
+// itself (events, clock, subs), but not who can edit, sharing, or delete.
+// The creator's players can view all of the creator's games.
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -22,8 +28,32 @@ service cloud.firestore {
       return request.auth.token.email.lower();
     }
 
+    function entryPath() {
+      return /databases/$(database)/documents/allow/$(email());
+    }
+
     function allowed() {
-      return signedIn() && exists(/databases/$(database)/documents/allow/$(email()));
+      return signedIn() && exists(entryPath());
+    }
+
+    function me() {
+      return get(entryPath()).data;
+    }
+
+    function role() {
+      return me().get('role', 'coach');
+    }
+
+    function isCoach() {
+      return allowed() && role() in ['coach', 'admin'];
+    }
+
+    function isAdmin() {
+      return allowed() && role() == 'admin';
+    }
+
+    function isPlayerOf(ownerUid) {
+      return allowed() && role() == 'player' && me().get('team', '') == ownerUid;
     }
 
     function isOwner(data) {
@@ -34,29 +64,52 @@ service cloud.firestore {
       return email() in data.get('editors', []);
     }
 
-    match /allow/{address} {
-      allow get: if signedIn() && address == email();
-      allow list: if allowed();
-      allow write: if false;
+    // A well-formed allowlist entry.
+    function validEntry(data) {
+      return data.keys().hasOnly(['name', 'role', 'team', 'addedBy'])
+        && data.get('name', '') is string && data.get('name', '').size() <= 60
+        && data.get('role', 'coach') in ['coach', 'admin', 'player']
+        && (data.get('role', 'coach') != 'player' || data.get('team', '') is string && data.get('team', '').size() > 0);
     }
 
-    // Your squad. If you share your team, coaches can read it (never change it).
+    // A player entry belonging to the signed-in coach.
+    function myPlayer(data) {
+      return data.get('role', 'coach') == 'player' && data.get('team', '') == request.auth.uid;
+    }
+
+    match /allow/{address} {
+      allow get: if signedIn() && address == email();
+      allow get, list: if isCoach();
+      // Admins add anyone; coaches add players to their own team.
+      allow create: if validEntry(request.resource.data)
+        && address == address.lower() && address.matches('.+@.+')
+        && (isAdmin() || (isCoach() && myPlayer(request.resource.data)));
+      // Admins change anyone but can't demote themselves; coaches can rename their players.
+      allow update: if validEntry(request.resource.data)
+        && ((isAdmin() && (address != email() || request.resource.data.get('role', 'coach') == 'admin'))
+          || (isCoach() && myPlayer(resource.data) && myPlayer(request.resource.data)));
+      // Nobody removes themselves (no accidental lock-out).
+      allow delete: if address != email()
+        && (isAdmin() || (isCoach() && myPlayer(resource.data)));
+    }
+
     match /users/{uid} {
-      allow read: if allowed() && (request.auth.uid == uid || resource.data.shared == true);
-      allow write: if allowed() && request.auth.uid == uid;
+      allow read: if (isCoach() && (request.auth.uid == uid || resource.data.shared == true))
+        || isPlayerOf(uid);
+      allow write: if isCoach() && request.auth.uid == uid;
     }
 
     match /games/{gameId} {
-      allow read: if allowed()
-        && (isOwner(resource.data) || resource.data.shared == true || isEditor(resource.data));
-      allow create: if allowed()
+      allow read: if (isCoach() && (isOwner(resource.data) || resource.data.shared == true || isEditor(resource.data)))
+        || isPlayerOf(resource.data.owner);
+      allow create: if isCoach()
         && isOwner(request.resource.data)
         && gameId.matches(request.auth.uid + '_[0-9]+')
         && request.resource.data.shared is bool
         && request.resource.data.get('editors', []) is list;
       // The owner can change anything except handing the game to someone else.
       // An editor can only change the game itself (and its timestamp).
-      allow update: if allowed() && (
+      allow update: if isCoach() && (
         (isOwner(resource.data)
           && isOwner(request.resource.data)
           && request.resource.data.shared is bool
@@ -65,7 +118,7 @@ service cloud.firestore {
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['game', 'updated'])
           && request.resource.data.game.id == resource.data.game.id)
       );
-      allow delete: if allowed() && isOwner(resource.data);
+      allow delete: if isCoach() && isOwner(resource.data);
     }
 
     // Anything else: no access.

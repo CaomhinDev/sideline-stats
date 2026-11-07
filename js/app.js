@@ -25,7 +25,10 @@ const app = {
   shared: [], // games others have shared: [{ docId, owner, ownerName, names, game }]
   sharedTeams: [], // teams others have shared: [{ uid, ownerName, players }]
   coGames: [], // other coaches' games you can edit: [{ docId, owner, ownerName, st, game }]
-  coaches: [], // the allowlist: [{ email, name }]
+  people: [], // everyone on the allowlist (coaches and admins can see it): [{ email, name, role, team }]
+  coaches: [], // the coaches and admins among them
+  role: null, // "admin" | "coach" | "player"
+  playerTeam: null, // for a player: the uid of the coach whose team they follow
   route: { name: "games" },
   pending: null, // live entry: { gameId, x, y, type, playerId } – playerId undefined = not chosen, null = unknown
   statsFilter: { half: 0, types: new Set(S.EVENT_IDS), playerId: undefined },
@@ -78,11 +81,11 @@ function namesFor(game) {
 function gameOps(prev, cur) {
   const set = {};
   for (const key of new Set([...Object.keys(prev), ...Object.keys(cur)])) {
-    if (key === "events" || key === "subs") continue;
+    if (key === "events" || key === "subs" || key === "possession") continue;
     if (stable(prev[key]) !== stable(cur[key])) set[`game.${key}`] = cur[key] === undefined ? cloud.unset() : clone(cur[key]);
   }
   const ops = Object.keys(set).length ? [set] : [];
-  for (const key of ["events", "subs"]) {
+  for (const key of ["events", "subs", "possession"]) {
     const before = new Map((prev[key] ?? []).map((x) => [x.id, stable(x)]));
     const after = new Map((cur[key] ?? []).map((x) => [x.id, stable(x)]));
     const removed = (prev[key] ?? []).filter((x) => after.get(x.id) !== stable(x));
@@ -129,6 +132,25 @@ function track(promise) {
   });
 }
 
+/** A live feed was refused: if this account has been removed, lock the app. */
+async function accessLost(e) {
+  if (e?.code !== "permission-denied" || !app.user || !cloud) return;
+  if ((await cloud.getAccess(app.user)) === false) {
+    app.access = "denied";
+    stopWatching.forEach((stop) => stop());
+    stopWatching = [];
+    render();
+  }
+}
+
+/** Re-checks access, so someone removed from the list is locked out within a minute (or on reopening). */
+async function recheckAccess() {
+  if (app.access !== "allowed" || !app.user || !cloud || document.visibilityState !== "visible") return;
+  if ((await cloud.getAccess(app.user)) === false) accessLost({ code: "permission-denied" });
+}
+setInterval(recheckAccess, 60_000);
+document.addEventListener("visibilitychange", recheckAccess);
+
 async function syncFailed(e) {
   console.warn("Sync failed:", e);
   // Refused writes are either a removed coach (then lock the app) or, say, a game
@@ -143,7 +165,7 @@ const topFields = (g, teamShared) => ({ shared: teamShared || g.shared === true,
 
 /** Writes anything that changed since the last sync. Firestore queues writes while offline. */
 function pushChanges() {
-  if (!app.user || app.access !== "allowed") return;
+  if (!app.user || app.access !== "allowed" || app.role === "player") return;
   if (!cloud) {
     app.meta.unsynced = { ...app.meta.unsynced, [app.user.uid]: true };
     saveMeta();
@@ -151,11 +173,12 @@ function pushChanges() {
   }
   const uid = app.user.uid;
   const teamShared = app.state.shareTeam === true;
-  const players = JSON.stringify({ players: app.state.players, teamShared });
+  const teamName = app.state.teamName ?? "";
+  const players = JSON.stringify({ players: app.state.players, teamShared, teamName });
   if (players !== sent.players) {
     sent.players = players;
     notePending();
-    track(cloud.saveUser(app.user, { players: app.state.players, shared: teamShared }));
+    track(cloud.saveUser(app.user, { players: app.state.players, shared: teamShared, teamName }));
   }
   const live = new Set();
   for (const g of app.state.games) {
@@ -242,14 +265,14 @@ function receive(user, games, fromServer) {
   }
   let incoming;
   try {
-    incoming = S.parseState({ players: user?.players ?? [], games, shareTeam: user?.shared === true });
+    incoming = S.parseState({ players: user?.players ?? [], games, shareTeam: user?.shared === true, teamName: user?.teamName ?? "" });
   } catch (e) {
     console.warn("Ignoring unreadable cloud data:", e);
     return;
   }
   // Remember the server's copy as the base for future field-level updates.
   const teamShared = incoming.shareTeam === true;
-  sent.players = JSON.stringify({ players: incoming.players, teamShared });
+  sent.players = JSON.stringify({ players: incoming.players, teamShared, teamName: incoming.teamName ?? "" });
   sent.games = new Map(incoming.games.map((g) => [cloud.gameDocId(app.user.uid, g.id), { game: clone(g), top: stable(topFields(g, teamShared)) }]));
   // Usually this is just our own write coming back: keep the same objects (open
   // dialogs and Undo buttons hold references to them) unless something really changed.
@@ -294,9 +317,9 @@ function receiveEditable(list) {
 /** Squad and games in a fixed shape and order, for comparing two copies. */
 function canonical(state) {
   try {
-    const st = S.parseState({ players: state.players, games: state.games, shareTeam: state.shareTeam === true });
+    const st = S.parseState({ players: state.players, games: state.games, shareTeam: state.shareTeam === true, teamName: state.teamName ?? "" });
     st.games.sort((a, b) => a.id - b.id);
-    return stable({ players: st.players, games: st.games, shareTeam: st.shareTeam === true });
+    return stable({ players: st.players, games: st.games, shareTeam: st.shareTeam === true, teamName: st.teamName ?? "" });
   } catch {
     return Math.random().toString(); // unreadable: treat as different
   }
@@ -324,7 +347,10 @@ async function startAccount(user) {
   app.shared = [];
   app.sharedTeams = [];
   app.coGames = [];
+  app.people = [];
   app.coaches = [];
+  app.role = null;
+  app.playerTeam = null;
   app.user = user;
   app.authError = null;
   if (!user) {
@@ -342,34 +368,52 @@ async function startAccount(user) {
   app.access = "checking";
   render();
 
-  let ok = cloud ? await cloud.isAllowed(user) : null;
-  if (ok === null) ok = app.meta.allowed?.[user.uid] ?? null; // offline: trust the last answer
+  let access = cloud ? await cloud.getAccess(user) : null;
+  if (access === null) access = app.meta.roles?.[user.uid] ?? (app.meta.allowed?.[user.uid] ? { role: "coach" } : null); // offline: trust the last answer
   if (app.user !== user) return; // signed out meanwhile
-  if (ok !== true) {
-    app.access = ok === false ? "denied" : "unverifiable";
+  if (!access) {
+    app.access = access === false ? "denied" : "unverifiable";
     render();
     return;
   }
+  app.role = access.role;
+  app.playerTeam = access.team ?? null;
+  app.meta.roles = { ...app.meta.roles, [user.uid]: access };
   app.meta.allowed = { ...app.meta.allowed, [user.uid]: true };
   app.meta.lastUser = user;
   saveMeta();
   app.access = "allowed";
+  if (app.role === "player" && !["help", "data", "shared"].includes(app.route.name)) go("#/games");
   render();
   if (!cloud) {
     document.body.dataset.sync = "ready";
     return;
   }
-  const warn = (what) => (e) => console.warn(`${what} unavailable:`, e);
+  if (app.role === "player") {
+    // Players only follow their team, read only.
+    stopWatching.push(cloud.watchTeam(app.playerTeam, (team, games) => {
+      app.sharedTeams = team ? [{ uid: app.playerTeam, ...team }] : [];
+      app.shared = games;
+      document.body.dataset.sync = "ready";
+      render();
+    }, (e) => { console.warn("Team unavailable:", e); accessLost(e); }));
+    return;
+  }
+  const warn = (what) => (e) => { console.warn(`${what} unavailable:`, e); accessLost(e); };
   const rerenderOn = (...routes) => () => { if (routes.includes(app.route.name)) render(); };
   const sharedChanged = rerenderOn("games", "shared", "team");
   const teamsChanged = rerenderOn("games", "team");
-  const coachesChanged = rerenderOn("data", "stats");
+  const peopleChanged = rerenderOn("data", "stats", "admin");
   stopWatching.push(
     cloud.watchMine(user.uid, receive, syncFailed),
     cloud.watchShared(user.uid, (list) => { app.shared = list; sharedChanged(); }, warn("Shared games")),
     cloud.watchSharedTeams(user.uid, (list) => { app.sharedTeams = list; teamsChanged(); }, warn("Shared teams")),
     cloud.watchEditable(user, receiveEditable, warn("Games you can edit")),
-    cloud.watchCoaches((list) => { app.coaches = list; coachesChanged(); }, warn("Coaches list")),
+    cloud.watchPeople((list) => {
+      app.people = list;
+      app.coaches = list.filter((p) => p.role !== "player");
+      peopleChanged();
+    }, warn("Coaches list")),
   );
 }
 
@@ -423,6 +467,7 @@ function symbolShape(type, cx, cy, r, extra = {}) {
     case "circle": return s("circle", { ...extra, class: cls, cx, cy, r: r * 0.95 });
     case "diamond": return poly([[0, -1.15], [1.05, 0], [0, 1.15], [-1.05, 0]]);
     case "triangle": return poly([[0, -1.1], [1.05, 0.75], [-1.05, 0.75]]);
+    case "tri-down": return poly([[0, 1.1], [1.05, -0.75], [-1.05, -0.75]]);
     case "hexagon": return poly(Array.from({ length: 6 }, (_, i) => [Math.cos((Math.PI / 3) * i) * 1.05, Math.sin((Math.PI / 3) * i) * 1.05]));
     case "star": return poly(Array.from({ length: 10 }, (_, i) => {
       const a = (Math.PI / 5) * i - Math.PI / 2;
@@ -456,6 +501,7 @@ function openDialog({ title, body, okLabel = "OK", danger = false, cancel = true
   document.getElementById("dialog-error").hidden = true;
   document.getElementById("dialog-cancel").hidden = !cancel;
   const ok = document.getElementById("dialog-ok");
+  ok.disabled = false;
   ok.textContent = okLabel;
   ok.className = danger ? "btn btn-danger" : "btn";
   dialogOk = onOk;
@@ -526,7 +572,7 @@ async function importFile(file) {
     title: "Import this file?",
     body: [
       h("p", {}, `The file has ${summary(incoming)}.`),
-      hasData && h("p", {}, `It will replace what's in this browser now (${summary(cur)}). Export first if you want to keep a copy.`),
+      hasData && h("p", {}, `It will replace your current squad and games (${summary(cur)}) in your account. Export first if you want to keep a copy.`),
     ],
     okLabel: hasData ? "Replace" : "Import",
     danger: hasData,
@@ -548,7 +594,7 @@ function parseRoute() {
   if (parts[0] === "shared" && parts[1]) return { name: "shared", docId: decodeURIComponent(parts[1]) };
   if (parts[0] === "team" && parts[1]) return { name: "team", uid: decodeURIComponent(parts[1]) };
   if (parts[0] === "co" && parts[1]) return { name: parts[2] === "stats" ? "costats" : "co", docId: decodeURIComponent(parts[1]) };
-  if (["games", "squad", "data", "new", "help"].includes(parts[0])) return { name: parts[0] };
+  if (["games", "squad", "data", "new", "help", "admin"].includes(parts[0])) return { name: parts[0] };
   return { name: "games" };
 }
 
@@ -577,6 +623,11 @@ function render() {
     updateWakeLock(false);
     return;
   }
+  // Players can only view: their team's games and stats, help, and their account.
+  if (app.role === "player" && !["games", "shared", "team", "help", "data"].includes(app.route.name)) {
+    app.route = { name: "games" };
+    history.replaceState(null, "", "#/games");
+  }
   const r = app.route;
   const coEntry = r.name === "co" || r.name === "costats" ? app.coGames.find((x) => x.docId === r.docId) ?? null : null;
   const game = r.id != null ? findGame(r.id) : coEntry?.game ?? null;
@@ -589,6 +640,10 @@ function render() {
   document.body.classList.toggle("live", live);
   document.getElementById("tabs").hidden = live;
   const tab = ["new", "stats", "shared", "team", "co", "costats"].includes(r.name) ? "games" : r.name;
+  const tabs = document.getElementById("tabs");
+  tabs.dataset.role = app.role ?? "";
+  tabs.querySelector('[data-tab="admin"]').hidden = app.role !== "admin";
+  tabs.querySelector('[data-tab="squad"]').hidden = app.role === "player";
   for (const a of document.querySelectorAll(".tabs a")) {
     if (a.dataset.tab === tab) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
@@ -597,7 +652,7 @@ function render() {
   const notEditable = () => h("section", {}, h("a", { class: "link-btn", href: "#/games" }, "‹ Games"),
     h("h1", {}, "Not available"), h("p", { class: "muted" }, "You can't edit this game (anymore). The coach who created it may have removed you."));
   const views = {
-    games: viewGames, new: viewNewGame, live: () => viewLive(game), stats: () => viewStats(game), shared: viewShared, team: viewTeam, squad: viewSquad, data: viewData, help: viewHelp,
+    games: app.role === "player" ? viewPlayerHome : viewGames, admin: viewAdmin, new: viewNewGame, live: () => viewLive(game), stats: () => viewStats(game), shared: viewShared, team: viewTeam, squad: viewSquad, data: viewData, help: viewHelp,
     co: () => (coEntry ? viewLive(coEntry.game) : notEditable()),
     costats: () => (coEntry ? viewStats(coEntry.game, { st: coEntry.st, co: coEntry }) : notEditable()),
   };
@@ -634,46 +689,80 @@ function viewHelp() {
   const section = (title, open, ...items) => h("details", { open: open || null }, h("summary", {}, title), ...items);
   const ul = (...lis) => h("ul", {}, lis.map((li) => h("li", {}, li)));
   const b = (t) => h("strong", {}, t);
+  const table = (head, rows) => h("div", { class: "table-wrap" }, h("table", { class: "help-table" },
+    h("thead", {}, h("tr", {}, head.map((x) => h("th", {}, x)))),
+    h("tbody", {}, rows.map((r) => h("tr", {}, r.map((x) => h("td", {}, x)))))));
+  if (app.role === "player") {
+    return h("section", { class: "help", id: "help" },
+      h("h1", {}, "Help"),
+      section("Viewing your team", true, ul(
+        ["Your team's games are on ", b("Games"), ". Tap one for the score, possession, a pitch map and stats by player."],
+        ["Games update live while your coach logs them."],
+        ["You can view only; your coach makes all changes."])),
+      positionsSection(section, table, b));
+  }
   return h("section", { class: "help", id: "help" },
     h("h1", {}, "Help"),
     h("p", { class: "muted" }, "Log what happens in a match in three taps, then see who did what, where."),
-    section("1. Set up your squad", true, ul(
-      ["Go to ", b("Squad"), ". Type a shirt number and name, press Enter, repeat."],
-      ["Or ", b("Paste or upload a list"), ": one player per line, like ", h("code", {}, "7 Sam"), ". Spreadsheet CSV files work too."],
+    section("1. Set up your team", true, ul(
+      ["Go to ", b("Squad"), ". Enter your ", b("team's name"), " first: games show as \"Your team vs Rovers\"."],
+      ["Add players: type a shirt number and name, press Enter, repeat. Or ", b("Paste or upload a list"), " (one per line, like ", h("code", {}, "7 Sam"), "; CSV works too)."],
       "Numbers here are each player's usual number. You can change them for any single game.")),
     section("2. Start a game", false, ul(
       [b("Games → + New game"), ". Enter the opponent, date and half length."],
       ["Untick anyone not playing, and change a shirt number for that day if needed."],
-      [b("Start game"), " asks who's starting: tap players onto the pitch, then ", b("Kick off"), "."])),
+      [b("Start game"), " asks ", b("Who's starting?"), ": tick the starting players (or Select all), then ", b("Kick off"), "."])),
     section("3. Log events (three taps)", false, ul(
       ["Tap ", b("where"), " on the pitch, ", b("what"), " happened, and ", b("who"), ". Any order. It saves on the third tap."],
       ["Your team always attacks to the ", b("right"), ", in both halves."],
-      ["Green buttons are good for your team, red are bad."],
+      ["Events are in two blocks, each A–Z: ", b("Attack"), " (Assist … Throw in) and ", b("Defend"), " (Broken ball … Yellow card)."],
       [b("?"), " = one of yours but you didn't see who. ", b("Them"), " = the opposition (a Goal for Them is a goal conceded)."],
+      [b("Our ball / Their ball"), ": tap whoever has the ball to track possession. Tap the lit one again when the ball goes out."],
       ["Mistake? Tap ", b("Undo"), " under the clock, or ", b("Delete"), " in the Latest list."]),
       h("p", { class: "tip" }, "Tip: add the app to your phone's home screen (browser menu → Add to Home Screen) so it's one tap away.")),
     section("4. Clock, subs and team sheet", false, ul(
-      ["The big button runs the match: ", b("Start game → Half time → Start 2nd half → Full time"), ". Each step can be undone."],
+      ["The big button runs the match: ", b("Start game → Half time → Start 2nd half → Full time"), "."],
+      ["The ", b("⏸"), " button by the clock: ", b("Pause"), " (injury, stoppage), ", b("Restart this half"), " from its start (misclick), or ", b("Undo"), " the last step."],
       ["The clock keeps correct time even if the phone locks."],
-      [b("Subs"), ": tap who's coming off and who's going on, then ", b("Done"), ". Minutes played are counted for you."],
+      [b("Subs"), ": tap who's ", b("coming off"), ", then who's ", b("going on"), ". Check the ", b("Changes"), " list, then ", b("Make subs"), ". Minutes played are counted for you."],
       [b("Players"), ": change today's numbers or add someone who turned up."],
-      ["Started by accident or testing? ", b("Reset game"), " clears the clock and events but keeps the team sheet. ", b("Delete game"), " removes it. Both are in the ", b("⋯"), " menu on the Games screen, and can be undone straight after."])),
+      [b("Reset game"), " clears the clock and events but keeps the team sheet. ", b("Delete game"), " removes it. Both are in the ", b("⋯"), " menu on Games, and can be undone straight after."])),
     section("5. See the stats", false, ul(
-      ["Tap ", b("stats →"), " on a game: score, totals, a pitch map, and a table by player with minutes."],
-      ["Filter the map by half, team, or event type. Tap a player in the table to see only theirs."],
+      ["Tap ", b("stats →"), " on a game: score, ", b("possession"), ", totals, a pitch map, and a table by player with minutes."],
+      ["Filter by half, team, or event type. Tap a player in the table to see only theirs."],
       [b("Download CSV"), " opens in any spreadsheet. ", b("Season totals"), " are on the Games screen."])),
     section("6. Share with other coaches", false, ul(
       [b("One game, view only"), ": on its stats page, tick ", b("Share with coaches"), "."],
       [b("Your whole team, view only"), ": on ", b("Squad"), ", tick ", b("Share my team with coaches"), ". Covers every game, now and later."],
-      [b("Let a coach edit a game"), ": on its stats page, under ", b("Coaches who can edit this game"), ", tick their name. You can both log events at the same time."],
-      ["Only you can share, choose editors, change the team sheet or delete your games."],
-      ["Games others share or let you edit appear on your ", b("Games"), " screen."]),
-      h("p", { class: "tip" }, "The full coaches list is on the Account tab.")),
-    section("7. Accounts, offline and backups", false, ul(
-      ["Everything saves to your Google account after every tap, and syncs to your other devices."],
-      ["No signal? Keep going. It saves on the phone and uploads when you're back online."],
-      [b("Account → Export JSON"), " downloads a spare copy of everything."],
-      [b("New coach?"), " The app's owner adds them in the Firebase console: Firestore → ", h("code", {}, "allow"), " → a document named with their Gmail address in lowercase."])));
+      [b("Let a coach edit a game"), ": on its stats page, under ", b("Coaches who can edit this game"), ", tick their name. You can both log at the same time."],
+      ["Only you can share, choose editors, change the team sheet or delete your games."])),
+    section("7. Coaches, admins and players", false, ul(
+      [b("Coaches"), " use the app fully. ", b("Admins"), " are coaches who also add and remove coaches on the ", b("Admin"), " tab."],
+      [b("Players"), " can view your games and stats, live, and nothing else. Add their Google (Gmail) address under ", b("Account → Player logins"), "."],
+      ["Everything saves to your account after every tap. No signal? Keep going: it uploads when you're back online."],
+      [b("Account → Export JSON"), " downloads a spare copy of everything."])),
+    positionsSection(section, table, b));
+}
+
+/** Traditional shirt numbers and common formations. */
+function positionsSection(section, table, b) {
+  return section("Positions & numbers", false,
+    h("p", {}, "Traditionally each number goes with a position. Teams vary, but this is the usual pattern:"),
+    table(["No.", "Usual position"], [
+      ["1", "Goalkeeper"], ["2", "Right back"], ["3", "Left back"], ["4", "Centre back (or defensive midfield)"],
+      ["5", "Centre back"], ["6", "Defensive / centre midfield (or centre back)"], ["7", "Right wing"],
+      ["8", "Central midfield"], ["9", "Striker (centre forward)"], ["10", "Attacking midfield / second striker"], ["11", "Left wing"],
+    ]),
+    h("p", { style: "margin-top:12px" }, "Common formations (defence–midfield–attack), with typical numbers, keeper (1) behind:"),
+    table(["Formation", "Defence", "Midfield", "Attack"], [
+      ["4-4-2", "2 · 5 · 4 · 3", "7 · 6 · 8 · 11", "10 · 9"],
+      ["4-3-3", "2 · 5 · 4 · 3", "6 · 8 · 10", "7 · 9 · 11"],
+      ["4-2-3-1", "2 · 5 · 4 · 3", "6 · 8, then 7 · 10 · 11", "9"],
+      ["3-5-2", "4 · 5 · 6", "2 · 8 · 10 · 7 · 3 (wing-backs)", "9 · 11"],
+      ["9-a-side 3-2-3", "2 · 5 · 3", "4 · 8", "7 · 9 · 11"],
+      ["7-a-side 2-3-1", "2 · 3", "7 · 8 · 11", "9"],
+    ]),
+    h("p", { class: "tip" }, "Defence and midfield read right to left, as the team faces the opposition's goal (so 2 is on the right, 3 on the left)."));
 }
 
 // ---- Sign-in gate
@@ -750,8 +839,8 @@ function readShared(item) {
   }
 }
 
-function viewTeam() {
-  const team = app.sharedTeams.find((t) => t.uid === app.route.uid);
+function viewTeam(uid = app.route.uid) {
+  const team = app.sharedTeams.find((t) => t.uid === uid) ?? (app.role === "player" ? { uid, players: [], ownerName: "" } : null);
   if (!team) {
     return h("section", {}, h("a", { class: "link-btn", href: "#/games" }, "‹ Games"),
       h("h1", {}, "Not available"), h("p", { class: "muted" }, "This team is no longer shared with you."));
@@ -767,16 +856,16 @@ function viewTeam() {
   const season = S.seasonTally(st);
   const players = S.activePlayers(st);
   return h("section", {},
-    h("a", { class: "link-btn", href: "#/games" }, "‹ Games"),
-    h("h1", { style: "margin-bottom:4px" }, `${team.ownerName || "A coach"}'s team`),
-    h("p", { class: "muted" }, "Shared with you by another coach, view only."),
+    app.role !== "player" && h("a", { class: "link-btn", href: "#/games" }, "‹ Games"),
+    h("h1", { style: "margin-bottom:4px" }, team.teamName || `${team.ownerName || "A coach"}'s team`),
+    h("p", { class: "muted" }, app.role === "player" ? `Coached by ${team.ownerName || "your coach"}. View only.` : "Shared with you by another coach, view only."),
     h("h2", {}, `Games (${games.length})`),
     games.length
       ? h("ul", { class: "list", id: "team-games" }, games.map((x) => {
           const sc = S.score(x.game);
           return h("li", {},
             h("a", { class: "main", href: `#/shared/${encodeURIComponent(x.docId)}` },
-              h("div", { class: "primary" }, `vs ${x.game.opponent}`),
+              h("div", { class: "primary" }, S.matchTitle(x.game, x.ownerName)),
               h("div", { class: "secondary" }, fmtDate(x.game.date))),
             h("span", { class: "badge" }, `${sc.us}–${sc.them} · ${PHASE_LABEL[S.phase(x.game)]}`));
         }))
@@ -788,7 +877,21 @@ function viewTeam() {
       : h("p", { class: "muted" }, "No players yet."));
 }
 
+// ---- A player's home: their team, view only
+
+function viewPlayerHome() {
+  if (!app.sharedTeams.length && !app.shared.length) {
+    return h("section", {}, h("h1", {}, "Your team"), h("p", { class: "muted" }, document.body.dataset.sync === "ready"
+      ? "Nothing here yet. Your coach's games will appear once they've played one."
+      : "Loading…"));
+  }
+  return viewTeam(app.playerTeam);
+}
+
 // ---- Games list
+
+/** A shared team's name, for titles: their team name, else the coach's name. */
+const teamNameOf = (uid, fallback) => app.sharedTeams.find((t) => t.uid === uid)?.teamName || fallback || "Them";
 
 /** Shared games that aren't already shown under a shared team. */
 const sharedGamesOnly = () => {
@@ -814,11 +917,11 @@ function viewGames() {
           const status = `${showScore ? `${sc.us}–${sc.them} · ` : ""}${c.running ? `${PHASE_LABEL[c.phase]} ${S.formatClock(c.seconds)}` : PHASE_LABEL[c.phase]}`;
           return h("li", {},
             h("a", { class: "main", href: `#/game/${g.id}` },
-              h("div", { class: "primary" }, `vs ${g.opponent}`),
+              h("div", { class: "primary" }, S.matchTitle(g, st.teamName)),
               h("div", { class: "secondary" }, `${fmtDate(g.date)} · ${plural(g.events.length, "event")}`)),
             g.shared && h("span", { class: "badge", title: "Shared with coaches (view only)" }, "Shared"),
             h("span", { class: `badge${c.running ? " live" : ""}` }, status),
-            h("button", { type: "button", class: "link-btn more", "aria-label": `More for vs ${g.opponent}`, onclick: () => gameMenu(g) }, "⋯"));
+            h("button", { type: "button", class: "link-btn more", "aria-label": `More for ${S.matchTitle(g, st.teamName)}`, onclick: () => gameMenu(g) }, "⋯"));
         }))
       : h("p", { class: "muted", style: "margin-top:16px" }, "No games yet."),
     app.coGames.length > 0 && [
@@ -829,7 +932,7 @@ function viewGames() {
         const sc = S.score(x.game);
         return h("li", {},
           h("a", { class: "main", href: `#/co/${encodeURIComponent(x.docId)}` },
-            h("div", { class: "primary" }, `vs ${x.game.opponent}`),
+            h("div", { class: "primary" }, S.matchTitle(x.game, teamNameOf(x.owner, x.ownerName))),
             h("div", { class: "secondary" }, `${fmtDate(x.game.date)} · ${x.ownerName || "another coach"}'s game`)),
           h("span", { class: `badge${c.running ? " live" : ""}` }, `${sc.us}–${sc.them} · ${c.running ? `${PHASE_LABEL[c.phase]} ${S.formatClock(c.seconds)}` : PHASE_LABEL[c.phase]}`));
       }))],
@@ -849,7 +952,7 @@ function viewGames() {
         const sc = S.score(x.game);
         return h("li", {},
           h("a", { class: "main", href: `#/shared/${encodeURIComponent(x.docId)}` },
-            h("div", { class: "primary" }, `vs ${x.game.opponent}`),
+            h("div", { class: "primary" }, S.matchTitle(x.game, teamNameOf(x.owner, x.ownerName))),
             h("div", { class: "secondary" }, `${fmtDate(x.game.date)} · by ${x.ownerName || "another coach"}`)),
           h("span", { class: "badge" }, `${sc.us}–${sc.them} · ${PHASE_LABEL[S.phase(x.game)]}`));
       }))],
@@ -868,8 +971,14 @@ function viewNewGame() {
   const error = h("p", { class: "field-error", hidden: true, id: "new-game-error" });
   const sheet = rosterEditor(S.defaultRoster(app.state));
 
+  if (!app.state.teamName) {
+    return h("section", {}, h("h1", {}, "New game"),
+      h("p", {}, "First, name your team."),
+      teamNameForm({ onSaved: () => render() }));
+  }
   return h("section", {},
     h("h1", {}, "New game"),
+    h("p", { class: "muted" }, h("strong", {}, app.state.teamName), " vs …"),
     h("form", {
       novalidate: true,
       onsubmit: (e) => {
@@ -900,6 +1009,25 @@ function viewNewGame() {
       h("button", { type: "submit", class: "btn btn-block", id: "create-game" }, "Create game")));
 }
 
+/** Inline "your team's name" form, used on Squad and when starting a first game. */
+function teamNameForm({ onSaved, compact = false } = {}) {
+  const input = h("input", { id: "team-name", maxlength: S.TEAM_NAME_MAX, autocomplete: "off", placeholder: "e.g. Ballyhale U12", value: app.state.teamName ?? "", "aria-label": "Team name" });
+  const err = h("p", { class: "field-error", hidden: true, id: "team-name-error" });
+  const save = () => {
+    const msg = S.teamNameError(input.value);
+    if (msg) { err.textContent = msg; err.hidden = false; input.focus(); return false; }
+    commit((st) => { st.teamName = input.value.trim(); }, { rerender: !onSaved });
+    onSaved?.();
+    return true;
+  };
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); save(); } });
+  return h("div", { class: `card team-name${compact ? " compact" : ""}` },
+    h("label", { for: "team-name" }, "Your team's name"),
+    h("p", { class: "muted small", style: "margin:0 0 8px" }, "Shown on every game, e.g. \"Ballyhale U12 vs Rovers\"."),
+    h("div", { class: "row" }, h("div", { class: "grow" }, input), h("button", { type: "button", class: "btn", id: "save-team-name", onclick: save }, "Save")),
+    err);
+}
+
 // ---- Live entry
 
 /**
@@ -910,6 +1038,9 @@ function ctxFor(game) {
   const co = app.coGames.find((x) => x.game.id === game.id) ?? null;
   return { st: co ? co.st : app.state, co };
 }
+/** "Ballyhale U12 vs Rovers" for a game in this context. */
+const titleOf = (game, st = ctxFor(game).st) => S.matchTitle(game, st.teamName);
+
 const liveHref = (game) => { const { co } = ctxFor(game); return co ? `#/co/${encodeURIComponent(co.docId)}` : `#/game/${game.id}`; };
 
 /** The team sheet for this game: [{ id, number (worn today), name }], by number. */
@@ -941,25 +1072,36 @@ function viewLive(game) {
   });
 
   return h("section", {},
-    h("div", { class: "live-head" },
+    // The match title gets its own line, so both team names have room.
+    h("div", { class: "live-title" },
       h("a", { class: "back", href: "#/games", "aria-label": "Back to games" }, "‹"),
+      h("span", { class: "opp", title: titleOf(game) },
+        h("span", { class: "us-name" }, game.team || ctxFor(game).st.teamName || "Us"), h("span", { class: "vs-name" }, ` vs ${game.opponent}`))),
+    h("div", { class: "live-head" },
+      h("span", { class: "score", id: "score", "aria-label": `Score: us ${S.score(game).us}, them ${S.score(game).them}` }, `${S.score(game).us}–${S.score(game).them}`),
       h("div", { class: "title" },
-        // A long opponent name truncates; the goal count never does.
-        h("div", { class: "opp-line" }, h("span", { class: "opp" }, `vs ${game.opponent}`),
-          h("span", { class: "score", id: "score", "aria-label": `Score: us ${S.score(game).us}, them ${S.score(game).them}` }, `${S.score(game).us}–${S.score(game).them}`)),
-        h("div", { class: "clock-line" }, h("span", { class: "clock", id: "clock" }, S.formatClock(c.seconds)),
-          h("span", { class: "phase-label", id: "phase-label" }, PHASE_LABEL[c.phase]))),
+        h("div", { class: "clock-line" },
+          h("div", { class: "clock-stack" },
+            h("span", { class: `clock${c.paused ? " paused" : ""}`, id: "clock" }, S.formatClock(c.seconds)),
+            h("span", { class: "phase-label", id: "phase-label" }, c.paused ? "Paused" : PHASE_LABEL[c.phase])),
+          h("button", {
+            type: "button", class: "clock-btn", id: "clock-btn", "aria-label": "Clock options: pause, restart half, undo",
+            disabled: c.phase === "pre", onclick: () => clockMenu(game),
+          }, clockIcon(c.paused)))),
       next
         ? h("button", { type: "button", class: "btn phase-btn", id: "phase-btn", onclick: () => phaseAction(game) }, next)
         : h("a", { class: "btn btn-quiet phase-btn", href: `${liveHref(game)}/stats` }, "Stats")),
     h("div", { class: "live-status", id: "live-status", role: "status", "aria-live": "polite" }, liveStatusContent()),
+    possessionBar(game, c),
     h("div", { class: "pitch-wrap" }, pitch),
-    [true, false].map((positive) => h("div", {
-      class: `events ${positive ? "good" : "bad"}`, role: "group", "aria-label": positive ? "Good for the team" : "Bad for the team",
-    }, S.EVENT_TYPES.filter((t) => t.positive === positive).map((t) => h("button", {
+    ["attack", "defend"].map((side) => h("div", {
+      class: `events ${side}`, role: "group", "aria-label": side === "attack" ? "Attack" : "Defend",
+    },
+      h("span", { class: "side-label", "aria-hidden": "true" }, side === "attack" ? "Attack" : "Defend"),
+      S.eventButtons(side).map((t) => h("button", {
         type: "button", class: "ev-btn", "aria-pressed": String(pend.type === t.id), "data-event": t.id,
         onclick: () => { pend.type = pend.type === t.id ? undefined : t.id; afterPick(game); },
-      }, symbolIcon(t.id, 18), h("span", {}, t.label))))),
+      }, symbolIcon(t.id, 16), h("span", {}, t.label))))),
     h("div", { class: "players", role: "group", "aria-label": "Player" },
       players.map((p) => h("button", {
         type: "button", class: `pl-btn${benchDim && !on.has(p.id) ? " bench" : ""}`, "aria-pressed": String(pend.playerId === p.id), "data-number": p.number,
@@ -973,7 +1115,7 @@ function viewLive(game) {
       h("button", {
         type: "button", class: "pl-btn them", "aria-pressed": String(pend.playerId === "them"), "data-number": "them", "aria-label": `Opposition (${game.opponent})`,
         onclick: () => { pend.playerId = pend.playerId === "them" ? undefined : "them"; afterPick(game); },
-      }, h("span", { class: "n" }, "Them"), h("span", { class: "nm" }, "Opposition"))),
+      }, h("span", { class: "n" }, "Them"), h("span", { class: "nm" }, "Opp."))),
     h("div", { class: "tools" },
       h("button", { type: "button", class: "btn btn-quiet btn-small", disabled: !(pend.x != null || pend.type || pend.playerId !== undefined),
         onclick: () => { app.pending = { gameId: game.id }; render(); } }, "Clear"),
@@ -986,6 +1128,57 @@ function viewLive(game) {
       recent.length
         ? h("ul", { class: "list", id: "recent" }, recent.map((e) => eventRow(game, e)))
         : h("p", { class: "muted small" }, "Tap where, what and who, in any order. It saves when all three are chosen.")));
+}
+
+/** Pause (two bars) or play (triangle), drawn so it looks the same on every phone. */
+const clockIcon = (paused) => s("svg", { width: 16, height: 16, viewBox: "0 0 16 16", "aria-hidden": "true" },
+  paused ? s("path", { d: "M4 2.5v11l9-5.5z", fill: "currentColor" })
+    : [s("rect", { x: 3, y: 2.5, width: 3.5, height: 11, rx: 1, fill: "currentColor" }), s("rect", { x: 9.5, y: 2.5, width: 3.5, height: 11, rx: 1, fill: "currentColor" })]);
+
+/** "Our ball | Their ball": tap who has it; tap again when it goes out of play. */
+function possessionBar(game, c) {
+  const now = S.possessionNow(game);
+  const pct = S.possessionPercent(S.possessionTime(game));
+  const live = c.running;
+  const pick = (team) => {
+    const { st } = ctxFor(game);
+    commit(() => S.setPossession(st, current(game), S.possessionNow(current(game)) === team ? null : team));
+  };
+  return h("div", { class: "possession", role: "group", "aria-label": "Who has the ball" },
+    h("button", { type: "button", class: "poss-btn us", id: "poss-us", "aria-pressed": String(now === "us"), disabled: !live, onclick: () => pick("us") }, "Our ball"),
+    h("span", { class: "poss-pct", id: "poss-pct", title: "Possession, us – them" }, pct ? `${pct.us}% – ${pct.them}%` : live ? "Possession" : "–"),
+    h("button", { type: "button", class: "poss-btn them", id: "poss-them", "aria-pressed": String(now === "them"), disabled: !live, onclick: () => pick("them") }, "Their ball"));
+}
+
+/** Pause / resume, restart the half from its start, or undo the last clock step. */
+function clockMenu(game) {
+  const c = S.clock(game);
+  const live = c.phase === "first" || c.phase === "second";
+  const halfName = c.half === 1 ? "1st half" : "2nd half";
+  const lastStep = { first: "kick-off", half: "half time", second: "2nd-half kick-off", full: "full time" }[c.phase];
+  const close = (fn) => () => { dialog.close(); fn(); };
+  openDialog({
+    title: "Clock",
+    body: h("div", { class: "menu" },
+      h("p", { class: "muted small", style: "margin:0 0 4px" }, `${S.formatClock(c.seconds)} · ${c.paused ? "paused" : PHASE_LABEL[c.phase]}`),
+      live && h("button", { type: "button", class: "btn btn-block", id: "pause-btn", onclick: close(() => {
+        const was = c.paused;
+        commit(() => (was ? S.resumeClock(current(game)) : S.pauseClock(current(game))));
+        toast(was ? "Clock running." : "Clock paused.", () => commit(() => (was ? S.pauseClock(current(game)) : S.resumeClock(current(game)))));
+      }) }, clockIcon(!c.paused), c.paused ? " Resume clock" : " Pause clock"),
+      live && h("button", { type: "button", class: "btn btn-quiet btn-block", id: "restart-half", onclick: close(() => {
+        const half = c.half;
+        const old = commit(() => S.restartHalf(current(game)));
+        toast(`${halfName} restarted from ${S.formatClock((half - 1) * game.halfLength * 60)}.`, () => commit(() => Object.assign(current(game).periods[half - 1], old)));
+      }) }, `↺ Restart ${halfName} from ${S.formatClock((c.half - 1) * game.halfLength * 60)}`),
+      lastStep && h("button", { type: "button", class: "btn btn-quiet btn-block", id: "undo-step", onclick: close(() => {
+        const before = clone(current(game).periods);
+        commit(() => S.undoPhase(current(game)));
+        toast(`Undid ${lastStep}.`, () => commit(() => { current(game).periods = before; }));
+      }) }, `↶ Undo ${lastStep}`),
+      h("p", { class: "muted small", style: "margin:4px 0 0" }, "Restarting keeps events already logged in this half, with their times.")),
+    okLabel: "Close", cancel: false, onOk: () => {},
+  });
 }
 
 function afterPick(game) {
@@ -1053,43 +1246,84 @@ function phaseAction(game, { lineupDone = false } = {}) {
  */
 function subsDialog(game, { kickOff } = {}) {
   const players = matchdayPlayers(game);
+  if (kickOff || S.phase(game) === "pre") return lineupDialog(game, { kickOff });
   const mins = S.playingTime(game);
-  const before = new Set(S.onPitch(game));
-  const on = new Set(before);
-  const body = h("div", {});
-  const chip = (p) => h("button", {
-    type: "button", class: `sub-chip${on.has(p.id) !== before.has(p.id) ? " changed" : ""}`, "data-number": p.number,
-    "aria-label": `#${p.number} ${p.name}, ${on.has(p.id) ? "on the pitch" : "on the bench"}`,
-    onclick: () => { on.has(p.id) ? on.delete(p.id) : on.add(p.id); draw(); },
-  }, h("span", { class: "n" }, p.number), h("span", { class: "nm" }, p.name), S.phase(game) !== "pre" && h("span", { class: "mins" }, S.formatMinutes(mins.get(p.id))));
+  const onPitch = new Set(S.onPitch(game));
+  const offPicks = []; // in tap order, so pairs read naturally
+  const onPicks = [];
+  const label = (p) => `#${p.number}${p.name ? ` ${p.name}` : ""}`;
+  const byId = new Map(players.map((p) => [p.id, p]));
+  const body = h("div", { class: "subs" });
+  const toggle = (list, id) => { const i = list.indexOf(id); i >= 0 ? list.splice(i, 1) : list.push(id); draw(); };
+  const chip = (p, picked, tag, list) => h("button", {
+    type: "button", class: `sub-chip${picked ? ` picked ${tag}` : ""}`, "data-number": p.number, "aria-pressed": String(picked),
+    "aria-label": `${label(p)}, ${S.formatMinutes(mins.get(p.id))} played${picked ? `, going ${tag}` : ""}`,
+    onclick: () => toggle(list, p.id),
+  }, h("span", { class: "n" }, p.number), h("span", { class: "nm" }, p.name), h("span", { class: "mins" }, picked ? tag.toUpperCase() : S.formatMinutes(mins.get(p.id))));
   const draw = () => {
-    const pitch = players.filter((p) => on.has(p.id));
-    const bench = players.filter((p) => !on.has(p.id));
-    const goingOn = [...on].filter((id) => !before.has(id)).length;
-    const goingOff = [...before].filter((id) => !on.has(id)).length;
+    const pitch = players.filter((p) => onPitch.has(p.id));
+    const bench = players.filter((p) => !onPitch.has(p.id));
+    const pairs = Array.from({ length: Math.max(offPicks.length, onPicks.length) }, (_, i) => [byId.get(offPicks[i]), byId.get(onPicks[i])]);
     body.replaceChildren(
-      h("p", { class: "muted small" }, kickOff ? "Tap players to move them between bench and pitch." : "Tap who's coming off and who's going on, then Done. Minutes are recorded at that moment."),
-      h("div", { class: "step" }, h("h2", {}, `On the pitch (${pitch.length})`)),
-      h("div", { class: "sub-grid", id: "sub-on" }, pitch.map(chip)),
-      h("div", { class: "step" }, h("h2", {}, `Bench (${bench.length})`),
-        kickOff && h("button", { type: "button", class: "link-btn small", onclick: () => { players.forEach((p) => on.add(p.id)); draw(); } }, "Everyone on")),
-      h("div", { class: "sub-grid", id: "sub-bench" }, bench.map(chip)),
-      !kickOff && (goingOn || goingOff) ? h("p", { class: "small", style: "margin-top:8px" }, `${goingOff} off, ${goingOn} on`) : null);
+      h("h3", { class: "sub-step off" }, "1 · Tap who's coming off"),
+      h("div", { class: "sub-grid", id: "sub-off-grid" }, pitch.length ? pitch.map((p) => chip(p, offPicks.includes(p.id), "off", offPicks)) : h("p", { class: "muted small" }, "Nobody's on the pitch yet.")),
+      h("h3", { class: "sub-step on" }, "2 · Tap who's going on"),
+      h("div", { class: "sub-grid", id: "sub-on-grid" }, bench.length ? bench.map((p) => chip(p, onPicks.includes(p.id), "on", onPicks)) : h("p", { class: "muted small" }, "Nobody on the bench.")),
+      h("h3", { class: "sub-step" }, "Changes"),
+      h("ul", { class: "sub-summary", id: "sub-summary" }, pairs.length
+        ? pairs.map(([off, on]) => h("li", {},
+            off ? h("span", { class: "tag off" }, label(off)) : h("span", { class: "muted" }, "nobody off"),
+            h("span", { "aria-hidden": "true" }, " → "),
+            on ? h("span", { class: "tag on" }, label(on)) : h("span", { class: "muted" }, "nobody on")))
+        : h("li", { class: "muted" }, "None yet. Minutes are recorded when you press Make subs.")));
+    document.getElementById("dialog-ok").disabled = pairs.length === 0;
   };
-  draw();
   openDialog({
-    title: kickOff ? "Who's starting?" : "Substitutions",
+    title: "Substitutions",
     body,
-    okLabel: kickOff ? "Kick off" : "Done",
+    okLabel: "Make subs",
     onOk: () => {
-      const sub = commit(() => S.setOnPitch(ctxFor(game).st, current(game), [...on]));
-      if (kickOff) {
-        kickOff();
-      } else if (sub) {
-        const names = (ids) => ids.map((id) => `#${game.roster.find((r) => r.playerId === id)?.number}`).join(", ");
+      const next = new Set(onPitch);
+      offPicks.forEach((id) => next.delete(id));
+      onPicks.forEach((id) => next.add(id));
+      const sub = commit(() => S.setOnPitch(ctxFor(game).st, current(game), [...next]));
+      if (sub) {
+        const names = (ids) => ids.map((id) => `#${current(game).roster.find((r) => r.playerId === id)?.number}`).join(", ");
         toast(`Sub ${S.minuteLabel(sub, game.halfLength)}${sub.on.length ? ` · on ${names(sub.on)}` : ""}${sub.off.length ? ` · off ${names(sub.off)}` : ""}`,
           () => commit(() => S.deleteSub(current(game), sub.id)));
       }
+    },
+  });
+  draw();
+}
+
+/** Before kick-off: a simple checklist of who's starting. */
+function lineupDialog(game, { kickOff } = {}) {
+  const players = matchdayPlayers(game);
+  const picked = new Set(S.onPitch(game));
+  const body = h("div", { class: "subs" });
+  const draw = () => {
+    body.replaceChildren(
+      h("div", { class: "step" },
+        h("strong", { id: "start-count" }, `Starting: ${picked.size}`),
+        h("span", {},
+          h("button", { type: "button", class: "link-btn small", id: "select-all", onclick: () => { players.forEach((p) => picked.add(p.id)); draw(); } }, "Select all"),
+          h("button", { type: "button", class: "link-btn small", onclick: () => { picked.clear(); draw(); } }, "Clear"))),
+      h("div", { class: "sub-grid", id: "start-grid" }, players.map((p) => h("button", {
+        type: "button", class: `sub-chip${picked.has(p.id) ? " picked start" : ""}`, "data-number": p.number, "aria-pressed": String(picked.has(p.id)),
+        "aria-label": `#${p.number} ${p.name}${picked.has(p.id) ? ", starting" : ""}`,
+        onclick: () => { picked.has(p.id) ? picked.delete(p.id) : picked.add(p.id); draw(); },
+      }, h("span", { class: "n" }, p.number), h("span", { class: "nm" }, p.name), h("span", { class: "mins" }, picked.has(p.id) ? "✓" : "")))),
+      h("p", { class: "muted small", style: "margin-top:8px" }, kickOff ? "You can kick off with nobody picked; minutes just won't be counted." : "Change this any time before kick-off."));
+  };
+  draw();
+  openDialog({
+    title: "Who's starting?",
+    body,
+    okLabel: kickOff ? "Kick off" : "Save lineup",
+    onOk: () => {
+      commit(() => S.setOnPitch(ctxFor(game).st, current(game), [...picked]));
+      if (kickOff) kickOff();
     },
   });
 }
@@ -1216,6 +1450,7 @@ function viewStats(game, { st = app.state, readOnly = false, sharedBy = null, co
   const owner = !readOnly && !co; // only the creator can share, pick editors, edit details or delete
   const f = app.statsFilter;
   if (f.gameId !== game.id) Object.assign(f, { gameId: game.id, half: 0, types: new Set(S.EVENT_IDS), playerId: undefined, team: "us" });
+  const types = S.statTypes(game.events);
   const inHalf = game.events.filter((e) => !f.half || e.half === f.half);
   const t = S.tally(inHalf);
   const teamOf = (e) => e.team ?? "us";
@@ -1228,7 +1463,7 @@ function viewStats(game, { st = app.state, readOnly = false, sharedBy = null, co
     h("div", { class: "step", style: "margin:4px 0 12px" },
       readOnly ? h("a", { class: "link-btn", href: "#/games" }, "‹ Games") : h("a", { class: "link-btn", href: liveHref(game) }, "‹ Back to game"),
       h("span", { class: `badge${c.running ? " live" : ""}` }, c.running ? `${PHASE_LABEL[c.phase]} ${S.formatClock(c.seconds)}` : PHASE_LABEL[c.phase])),
-    h("h1", { style: "margin-bottom:4px" }, `vs ${game.opponent}`, " ", h("span", { class: "score big", id: "stats-score" }, `${S.score(game).us}–${S.score(game).them}`)),
+    h("h1", { style: "margin-bottom:4px" }, S.matchTitle(game, st.teamName), " ", h("span", { class: "score big", id: "stats-score" }, `${S.score(game).us}–${S.score(game).them}`)),
     h("p", { class: "muted" }, fmtDate(game.date), sharedBy && ` · shared by ${sharedBy} (view only)`, co && ` · ${co.ownerName || "another coach"}'s game, you can edit`),
     owner && h("label", { class: "share-toggle" },
       h("input", { type: "checkbox", id: "share-toggle", checked: game.shared === true, onchange: (e) => commit(() => { current(game).shared = e.target.checked; if (!e.target.checked) delete current(game).shared; }) }),
@@ -1237,8 +1472,9 @@ function viewStats(game, { st = app.state, readOnly = false, sharedBy = null, co
     h("div", { class: "chips", role: "group", "aria-label": "Half" },
       [["Both halves", 0], ["1st half", 1], ["2nd half", 2]].map(([label, v]) =>
         h("button", { type: "button", class: "chip", "aria-pressed": String(f.half === v), onclick: () => { f.half = v; render(); } }, label))),
+    possessionSummary(game, f.half),
     h("h2", {}, "Team totals"),
-    h("div", { class: "totals" }, S.EVENT_TYPES.map((et) => h("div", { class: et.positive ? "good" : "bad" },
+    h("div", { class: "totals" }, types.map((et) => h("div", { class: et.side },
       h("div", { class: "v", "data-total": et.id }, t.total[et.id]),
       h("div", { class: "k" }, symbolIcon(et.id, 12), et.short)))),
     h("h2", {}, "Where it happened"),
@@ -1246,7 +1482,7 @@ function viewStats(game, { st = app.state, readOnly = false, sharedBy = null, co
       [["Us", "us"], ["Opposition", "them"], ["Both", "all"]].map(([label, v]) =>
         h("button", { type: "button", class: "chip", "data-team": v, "aria-pressed": String(f.team === v), onclick: () => { f.team = v; if (v === "them") f.playerId = undefined; render(); } }, label))),
     h("div", { class: "chips", role: "group", "aria-label": "Show events" },
-      S.EVENT_TYPES.map((et) => h("button", {
+      types.map((et) => h("button", {
         type: "button", class: "chip", "aria-pressed": String(f.types.has(et.id)),
         onclick: () => { f.types.has(et.id) ? f.types.delete(et.id) : f.types.add(et.id); render(); },
       }, symbolIcon(et.id, 14), et.label))),
@@ -1280,7 +1516,7 @@ function viewStats(game, { st = app.state, readOnly = false, sharedBy = null, co
 /** Reset: back to before kick-off, keeping the game's details and team sheet. Undoable. */
 function confirmReset(game) {
   openDialog({
-    title: `Reset game vs ${game.opponent}?`,
+    title: `Reset ${S.matchTitle(game, app.state.teamName)}?`,
     body: [
       h("p", {}, `Clears the clock, ${plural(game.events.length, "event")}, subs and starting lineup, as if it never kicked off.`),
       h("p", { class: "muted small" }, "Keeps the opponent, date, half length and team sheet."),
@@ -1296,14 +1532,14 @@ function confirmReset(game) {
 /** Delete: removes the game everywhere (your account, and anyone it's shared with). Undoable straight away. */
 function confirmDelete(game) {
   openDialog({
-    title: `Delete game vs ${game.opponent}?`,
+    title: `Delete ${S.matchTitle(game, app.state.teamName)}?`,
     body: h("p", {}, `This deletes the game and its ${plural(game.events.length, "event")}, for you and anyone it's shared with.`),
     okLabel: "Delete", danger: true,
     onOk: () => {
       const copy = clone(current(game));
       commit((st) => S.deleteGame(st, game.id), { rerender: false });
       go("#/games");
-      toast(`Deleted game vs ${copy.opponent}.`, () => commit((st) => { if (!st.games.some((g) => g.id === copy.id)) st.games.push(copy); }));
+      toast(`Deleted ${S.matchTitle(copy, app.state.teamName)}.`, () => commit((st) => { if (!st.games.some((g) => g.id === copy.id)) st.games.push(copy); }));
     },
   });
 }
@@ -1311,7 +1547,7 @@ function confirmDelete(game) {
 /** The ⋯ menu on one of your games in the Games list. */
 function gameMenu(game) {
   openDialog({
-    title: `vs ${game.opponent}`,
+    title: S.matchTitle(game, app.state.teamName),
     body: h("div", { class: "menu" },
       h("p", { class: "muted small", style: "margin:0 0 8px" }, fmtDate(game.date)),
       h("button", { type: "button", class: "btn btn-quiet btn-block", onclick: () => { dialog.close(); go(`#/game/${game.id}/stats`); } }, "Stats"),
@@ -1320,6 +1556,19 @@ function gameMenu(game) {
       h("button", { type: "button", class: "btn btn-danger btn-block", id: "menu-delete", onclick: () => { dialog.close(); confirmDelete(game); } }, "Delete game")),
     okLabel: "Close", cancel: false, onOk: () => {},
   });
+}
+
+/** Possession for the game (or one half), when it was recorded. */
+function possessionSummary(game, half) {
+  const t = S.possessionTime(game);
+  const pct = S.possessionPercent(half ? t.half[half] : t);
+  if (!pct) return null;
+  return h("div", { class: "card poss-card", id: "poss-summary" },
+    h("div", { class: "step", style: "margin:0 0 6px" }, h("strong", {}, "Possession"), h("span", { class: "muted small" }, half ? `${half === 1 ? "1st" : "2nd"} half` : "whole game")),
+    h("div", { class: "poss-meter", role: "img", "aria-label": `Possession: us ${pct.us}%, them ${pct.them}%` },
+      h("span", { class: "us", style: `width:${pct.us}%` }, `${pct.us}%`),
+      h("span", { class: "them", style: `width:${pct.them}%` }, `${pct.them}%`)),
+    h("div", { class: "step small muted", style: "margin:4px 0 0" }, h("span", {}, "Us"), h("span", {}, "Them")));
 }
 
 /** The creator picks which coaches can edit this game alongside them. */
@@ -1346,7 +1595,7 @@ function editorsPicker(game) {
 }
 
 /** With a game, players are labelled and sorted by the number they wore in it. */
-function statsTable(t, { selectable, game, minutes = new Map(), st = app.state }) {
+function statsTable(t, { selectable, game, minutes = new Map(), st = app.state, events = game ? game.events : st.games.flatMap((g) => g.events) }) {
   const labelFor = (k) => (game ? S.gamePlayerLabel(st, game, k) : S.playerLabel(st, k));
   const numberFor = (k) => game?.roster.find((r) => r.playerId === k)?.number ?? st.players.find((p) => p.id === k)?.number ?? 0;
   const f = app.statsFilter;
@@ -1356,20 +1605,22 @@ function statsTable(t, { selectable, game, minutes = new Map(), st = app.state }
     if (b === "unknown") return -1;
     return numberFor(a) - numberFor(b);
   });
-  const sum = (counts) => S.EVENT_IDS.reduce((n, id) => n + counts[id], 0);
+  const types = S.statTypes(events);
+  const ids = types.map((t) => t.id);
+  const sum = (counts) => ids.reduce((n, id) => n + counts[id], 0);
   return h("div", { class: "table-wrap" }, h("table", {},
-    h("thead", {}, h("tr", {}, h("th", {}, "Player"), h("th", { class: "num" }, "Mins"), S.EVENT_TYPES.map((et) => h("th", { class: "num", title: et.label }, et.short)), h("th", { class: "num" }, "All"))),
+    h("thead", {}, h("tr", {}, h("th", {}, "Player"), h("th", { class: "num" }, "Mins"), types.map((et) => h("th", { class: "num", title: et.label }, et.short)), h("th", { class: "num" }, "All"))),
     h("tbody", {}, keys.map((k) => {
       const counts = t.byPlayer.get(k) ?? Object.fromEntries(S.EVENT_IDS.map((id) => [id, 0]));
       return h("tr", {
         class: selectable ? "clickable" : null,
         "aria-selected": selectable ? String(f.playerId === k) : null,
         onclick: selectable ? () => { f.playerId = f.playerId === k ? undefined : k; render(); } : null,
-      }, h("td", {}, labelFor(k)), h("td", { class: "num" }, k === "unknown" ? "" : S.formatMinutes(minutes.get(k))), S.EVENT_IDS.map((id) => h("td", { class: "num" }, counts[id] || "·")), h("td", { class: "num" }, sum(counts)));
+      }, h("td", {}, labelFor(k)), h("td", { class: "num" }, k === "unknown" ? "" : S.formatMinutes(minutes.get(k))), ids.map((id) => h("td", { class: "num" }, counts[id] || "·")), h("td", { class: "num" }, sum(counts)));
     })),
     h("tfoot", {},
-      h("tr", {}, h("td", {}, "Team"), h("td", {}), S.EVENT_IDS.map((id) => h("td", { class: "num" }, t.total[id])), h("td", { class: "num" }, sum(t.total))),
-      game && sum(t.them) > 0 && h("tr", { class: "them-row" }, h("td", {}, "Opposition"), h("td", {}), S.EVENT_IDS.map((id) => h("td", { class: "num" }, t.them[id] || "·")), h("td", { class: "num" }, sum(t.them))))));
+      h("tr", {}, h("td", {}, "Team"), h("td", {}), ids.map((id) => h("td", { class: "num" }, t.total[id])), h("td", { class: "num" }, sum(t.total))),
+      game && sum(t.them) > 0 && h("tr", { class: "them-row" }, h("td", {}, "Opposition"), h("td", {}), ids.map((id) => h("td", { class: "num" }, t.them[id] || "·")), h("td", { class: "num" }, sum(t.them))))));
 }
 
 function editGame(game) {
@@ -1402,7 +1653,8 @@ function viewSquad() {
     onchange: async (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) { bulk.value = await f.text(); previewBulk(bulk.value); } } });
 
   return h("section", {},
-    h("h1", {}, "Squad"),
+    h("h1", {}, app.state.teamName || "Squad"),
+    teamNameForm(),
     h("label", { class: "share-toggle" },
       h("input", { type: "checkbox", id: "share-team", checked: app.state.shareTeam === true, onchange: (e) => commit((st) => { if (e.target.checked) st.shareTeam = true; else delete st.shareTeam; }) }),
       h("span", {}, h("strong", {}, "Share my team with coaches"), h("br"),
@@ -1491,31 +1743,37 @@ function viewData() {
   const st = app.state;
   const m = app.meta;
   const events = st.games.reduce((n, g) => n + g.events.length, 0);
+  const account = h("div", { class: "card", id: "account" },
+    h("p", {}, "Signed in as ", h("strong", {}, app.user?.email), app.role ? ` (${app.role})` : "", "."),
+    h("p", { class: "muted small" }, app.role === "player"
+      ? "You can view your team's games and stats, live. Ask your coach if something's missing."
+      : cloud
+        ? "Your squad and games save to your account after every tap, and a copy is kept on this phone so it works without signal. Changes made offline upload when you reconnect."
+        : "Working offline from this phone's copy. Changes will upload next time the app opens with a connection."),
+    h("button", { type: "button", class: "btn btn-quiet btn-small", id: "sign-out", onclick: () => cloud?.signOut() }, "Sign out"));
+  if (app.role === "player") return h("section", {}, h("h1", {}, "Account"), account);
+
   const file = h("input", { type: "file", accept: ".json,application/json", id: "import-file", class: "visually-hidden",
     onchange: (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) importFile(f); } });
   return h("section", {},
     h("h1", {}, "Account"),
-    h("div", { class: "card", id: "account" },
-      h("p", {}, "Signed in as ", h("strong", {}, app.user?.email), "."),
-      h("p", { class: "muted small" }, cloud
-        ? "Your squad and games save to your account after every tap, and a copy is kept on this phone so it works without signal. Changes made offline upload when you reconnect."
-        : "Working offline from this phone's copy. Changes will upload next time the app opens with a connection."),
-      h("button", { type: "button", class: "btn btn-quiet btn-small", id: "sign-out", onclick: () => cloud?.signOut() }, "Sign out")),
+    account,
     h("h2", {}, `Coaches (${app.coaches.length})`),
-    h("p", { class: "muted small" }, "Everyone who can use Sideline Stats. Share a game or your team with all of them, or pick editors on a game's stats page."),
+    h("p", { class: "muted small" }, "Everyone who coaches on Sideline Stats. Share a game or your team with all of them, or pick editors on a game's stats page."),
     app.coaches.length
       ? h("ul", { class: "list", id: "coaches" }, app.coaches.map((c) => h("li", {},
-          h("div", { class: "main" }, h("div", { class: "primary" }, c.name || c.email, c.email === app.user?.email ? " (you)" : ""), c.name && h("div", { class: "secondary" }, c.email)))))
+          h("div", { class: "main" },
+            h("div", { class: "primary" }, c.name || c.email, c.email === app.user?.email ? " (you)" : "", c.role === "admin" && h("span", { class: "badge", style: "margin-left:6px" }, "Admin")),
+            c.name && h("div", { class: "secondary" }, c.email)))))
       : h("p", { class: "muted small" }, "Loading…"),
-    h("p", { class: "muted small", style: "margin-top:8px" }, "To add or remove a coach: Firebase console → Firestore → ", h("code", {}, "allow"),
-      " collection. Add a document whose ID is their Gmail address in lowercase, with a ", h("code", {}, "name"), " field."),
-    h("div", { class: "card" },
-      h("p", { class: "muted small", style: "margin:0" }, `${plural(S.activePlayers(st).length, "player")}, ${plural(st.games.length, "game")}, ${plural(events, "event")}.`)),
+    h("p", { class: "muted small", style: "margin-top:8px" }, app.role === "admin" ? "Add or remove coaches on the Admin tab." : "Admins add and remove coaches."),
+    myPlayersSection(),
     h("h2", {}, "Back up"),
-    h("p", {}, "Download everything as a JSON file, as an extra copy outside your account."),
-    h("p", { class: "muted small" }, m.lastExportAt
-      ? `Last export: ${new Date(m.lastExportAt).toLocaleString()}${m.changesSinceExport ? ` (${plural(m.changesSinceExport, "change")} since)` : " (up to date)"}.`
-      : "Not exported yet."),
+    h("p", {}, "Everything is already saved to your account. For an extra copy outside it, download a JSON file."),
+    h("p", { class: "muted small" }, `${plural(S.activePlayers(st).length, "player")}, ${plural(st.games.length, "game")}, ${plural(events, "event")}. `,
+      m.lastExportAt
+        ? `Last export: ${new Date(m.lastExportAt).toLocaleString()}${m.changesSinceExport ? ` (${plural(m.changesSinceExport, "change")} since)` : " (up to date)"}.`
+        : "Not exported yet."),
     h("button", { type: "button", class: "btn", id: "export", onclick: exportData }, "Export JSON"),
     h("h2", {}, "Restore"),
     h("p", {}, "Load a JSON file you exported earlier. It replaces your squad and games, in your account too."),
@@ -1527,6 +1785,97 @@ function viewData() {
         title: "Delete all data?", body: h("p", {}, "This removes your squad and every game, from your account too. Export first if you might want it back."),
         okLabel: "Delete everything", danger: true, onOk: () => commit((st) => Object.assign(st, S.emptyState())),
       }) }, "Delete all data")]);
+}
+
+/** A coach's own player logins: players see this coach's games and stats, nothing else. */
+function myPlayersSection() {
+  const mine = app.people.filter((p) => p.role === "player" && p.team === app.user?.uid);
+  const email = h("input", { id: "player-email", type: "email", autocomplete: "off", placeholder: "their.gmail@gmail.com", "aria-label": "Player's Gmail address" });
+  const name = h("input", { id: "player-name", autocomplete: "off", maxlength: 60, placeholder: "Name", "aria-label": "Player's name" });
+  const err = h("p", { class: "field-error", hidden: true, id: "player-error" });
+  const add = async () => {
+    const e = email.value.trim().toLowerCase();
+    const problem = !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e) ? "Enter their Google (Gmail) address"
+      : app.people.some((p) => p.email === e) ? "That address already has access" : null;
+    if (problem) { err.textContent = problem; err.hidden = false; return; }
+    try {
+      await cloud.addPerson(e, { name: name.value, role: "player", team: app.user.uid }, app.user.email);
+      toast(`${name.value.trim() || e} can now view your team.`);
+    } catch (x) {
+      err.textContent = `Couldn't add them: ${x.message}`;
+      err.hidden = false;
+    }
+  };
+  return [
+    h("h2", {}, `Player logins (${mine.length})`),
+    h("p", { class: "muted small" }, "Players can view your games and stats, live, and nothing else. They sign in with their Google account."),
+    mine.length > 0 && h("ul", { class: "list", id: "my-players" }, mine.map((p) => h("li", {},
+      h("div", { class: "main" }, h("div", { class: "primary" }, p.name || p.email), p.name && h("div", { class: "secondary" }, p.email)),
+      h("button", { type: "button", class: "link-btn", "aria-label": `Remove ${p.email}`, onclick: () => openDialog({
+        title: `Remove ${p.name || p.email}?`, body: h("p", {}, "They'll no longer be able to sign in."), okLabel: "Remove", danger: true,
+        onOk: () => { cloud.removePerson(p.email).then(() => toast(`Removed ${p.name || p.email}.`), (x) => toast(`Couldn't remove: ${x.message}`)); },
+      }) }, "Remove")))),
+    h("div", { class: "row", style: "flex-wrap:wrap;margin-top:8px" },
+      h("div", { class: "grow", style: "min-width:200px" }, email), h("div", { class: "grow", style: "min-width:120px" }, name),
+      h("button", { type: "button", class: "btn", id: "add-player-login", onclick: add }, "Add player")),
+    err,
+  ];
+}
+
+// ---- Admin
+
+function viewAdmin() {
+  if (app.role !== "admin") return h("section", {}, h("h1", {}, "Admin"), h("p", { class: "muted" }, "Only admins can see this."));
+  const email = h("input", { id: "admin-email", type: "email", autocomplete: "off", placeholder: "coach@gmail.com", "aria-label": "Gmail address" });
+  const name = h("input", { id: "admin-name", autocomplete: "off", maxlength: 60, placeholder: "Name", "aria-label": "Name" });
+  const role = h("select", { id: "admin-role", "aria-label": "Role" },
+    h("option", { value: "coach" }, "Coach"), h("option", { value: "admin" }, "Admin (coach who manages people)"));
+  const err = h("p", { class: "field-error", hidden: true, id: "admin-error" });
+  const add = async () => {
+    const e = email.value.trim().toLowerCase();
+    const problem = !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e) ? "Enter their Google (Gmail) address"
+      : app.people.some((p) => p.email === e) ? "That address is already on the list" : null;
+    if (problem) { err.textContent = problem; err.hidden = false; return; }
+    try {
+      await cloud.addPerson(e, { name: name.value, role: role.value }, app.user.email);
+      toast(`Added ${name.value.trim() || e}.`);
+    } catch (x) {
+      err.textContent = `Couldn't add: ${x.message}`;
+      err.hidden = false;
+    }
+  };
+  const coachName = (uid) => {
+    const team = app.sharedTeams.find((t) => t.uid === uid);
+    return team?.teamName || team?.ownerName || (uid === app.user.uid ? (app.state.teamName || "you") : "a coach");
+  };
+  const row = (p) => {
+    const me = p.email === app.user.email;
+    return h("li", { "data-email": p.email },
+      h("div", { class: "main" },
+        h("div", { class: "primary" }, p.name || p.email, me ? " (you)" : ""),
+        h("div", { class: "secondary" }, [p.name && p.email, p.role === "player" && `player · ${coachName(p.team)}`].filter(Boolean).join(" · "))),
+      p.role !== "player" && !me && h("button", {
+        type: "button", class: "link-btn", "aria-label": `${p.role === "admin" ? "Remove admin from" : "Make admin"} ${p.email}`,
+        onclick: () => cloud.setRole(p.email, p.role === "admin" ? "coach" : "admin").catch((x) => toast(`Couldn't change: ${x.message}`)),
+      }, p.role === "admin" ? "Make coach" : "Make admin"),
+      !me && h("button", { type: "button", class: "link-btn", "aria-label": `Remove ${p.email}`, onclick: () => openDialog({
+        title: `Remove ${p.name || p.email}?`, body: h("p", {}, "They'll no longer be able to sign in. Their games stay in their account."), okLabel: "Remove", danger: true,
+        onOk: () => { cloud.removePerson(p.email).then(() => toast(`Removed ${p.name || p.email}.`), (x) => toast(`Couldn't remove: ${x.message}`)); },
+      }) }, "Remove"));
+  };
+  const group = (title, id, list) => [h("h2", {}, `${title} (${list.length})`), list.length ? h("ul", { class: "list", id }, list.map(row)) : h("p", { class: "muted small" }, "None.")];
+  return h("section", { id: "admin" },
+    h("h1", {}, "Admin"),
+    h("p", { class: "muted" }, "Add coaches and admins here. Coaches add their own player logins on the Account tab."),
+    h("div", { class: "card" },
+      h("label", { for: "admin-email" }, "Add a coach"),
+      h("div", { class: "field" }, email),
+      h("div", { class: "row field" }, h("div", { class: "grow" }, name), h("div", { class: "grow" }, role)),
+      h("button", { type: "button", class: "btn btn-block", id: "admin-add", onclick: add }, "Add"),
+      err),
+    group("Admins", "admins", app.people.filter((p) => p.role === "admin")),
+    group("Coaches", "coach-list", app.people.filter((p) => p.role === "coach")),
+    group("Players", "players", app.people.filter((p) => p.role === "player")));
 }
 
 // ---------------------------------------------------------------- clock & screen

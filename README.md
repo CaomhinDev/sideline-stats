@@ -13,7 +13,9 @@ chosen). Plain HTML, CSS and JavaScript, no build step, no server-side code.
 - **Events:** tackle won, won in air, lost in air, shot on target, shot off target.
 - **Stats:** totals, per-player table, pitch map with filters, CSV download,
   and season totals across games.
-- **Data:** saved in browser storage on this device; Export/Import JSON as a backup.
+- **Accounts:** Google sign-in. Admins manage coaches, coaches add view-only
+  player logins; data syncs to Firebase (Firestore) with an offline copy on
+  the phone. Export/Import JSON as an extra backup.
 
 ## Run locally
 

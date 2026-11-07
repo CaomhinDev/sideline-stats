@@ -16,14 +16,14 @@ for (const scheme of ["light", "dark"]) {
       const names = ["Sam", "Alex", "Chris", "Pat", "Jamie", "Rory", "Jordan", "Lee", "Dan", "Finn", "Cian", "Oisin", "Liam", "Conor"];
       const nums = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16];
       const players = names.map((name, i) => ({ id: i + 1, number: nums[i], name }));
-      const types = ["tackle_won", "broken_won", "broken_lost", "air_won", "air_lost", "save", "shot_on", "shot_off", "goal", "yellow"];
+      const types = ["tackle_won", "broken_won", "broken_lost", "air_won", "interception", "clearance", "foul", "pass", "cross", "assist", "shot", "shot_on", "shot_off", "goal", "yellow", "throw_in"];
       let seed = 7;
       const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
       const events = [];
       let id = 100;
       for (let i = 0; i < 46; i++) {
-        const type = types[Math.floor(rnd() * 10)];
-        const shot = type.startsWith("shot") || type === "goal";
+        const type = types[Math.floor(rnd() * types.length)];
+        const shot = type.startsWith("shot") || type === "goal" || type === "assist" || type === "cross";
         const half = i < 26 ? 1 : 2;
         events.push({
           id: id++, type, playerId: Math.floor(rnd() * 14) + 1,
@@ -41,7 +41,11 @@ for (const scheme of ["light", "dark"]) {
         { id: 51, opponent: "City", date: "2026-10-31", halfLength: 30, squad: players.map((p) => p.id),
           periods: [{ start: 1, end: 1800001 }, { start: 2000000, end: 3800000 }], events: events.slice(0, 20).map((e) => ({ ...e, id: e.id + 1000 })) },
       ];
-      localStorage.setItem("sideline.data.v1", JSON.stringify({ nextId: 5000, players, games }));
+      games[0].possession = [
+        { id: 950, half: 1, t: 0, team: "us" }, { id: 951, half: 1, t: 400, team: "them" }, { id: 952, half: 1, t: 700, team: "us" },
+        { id: 953, half: 1, t: 1500, team: "them" }, { id: 954, half: 2, t: 1800, team: "us" },
+      ];
+      localStorage.setItem("sideline.data.v1", JSON.stringify({ nextId: 5000, teamName: "Ballyhale U12", players, games }));
     });
     await page.reload();
     await signInAs(page, email); // first sign-in uploads the seeded data
@@ -68,8 +72,8 @@ for (const scheme of ["light", "dark"]) {
     await shot("editors");
     await page.goto("./#/game/50");
     await page.locator("#subs-btn").click();
-    await page.locator('#sub-on .sub-chip[data-number="5"]').click();
-    await page.locator('#sub-bench .sub-chip[data-number="9"]').click();
+    await page.locator('#sub-off-grid .sub-chip[data-number="5"]').click();
+    await page.locator('#sub-on-grid .sub-chip[data-number="9"]').click();
     await shot("subs");
     await page.locator("#dialog-cancel").click();
     await page.goto("./#/new");

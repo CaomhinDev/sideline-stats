@@ -74,7 +74,7 @@ test("game phases advance and can be undone", () => {
 test("clock: first half from 0, second half continues from half length, survives reloads", () => {
   const st = squad();
   const g = S.createGame(st, { opponent: "R", halfLength: 25 }).game;
-  assert.deepEqual(S.clock(g, 5), { phase: "pre", half: 1, seconds: 0, running: false });
+  assert.deepEqual(S.clock(g, 5), { phase: "pre", half: 1, seconds: 0, running: false, paused: false });
   S.advancePhase(g, 10_000);
   assert.equal(S.clock(g, 10_000 + 83_500).seconds, 83);
   assert.equal(S.formatClock(83), "01:23");
@@ -126,7 +126,7 @@ test("CSV export lists events in match order with escaping", () => {
   const lines = S.gameCSV(st, g).trim().split("\n");
   assert.equal(lines[0].split(",")[0], "Minute");
   assert.ok(lines.includes("Score,0-0"));
-  assert.match(lines[1], /^1',1,00:30,Tackle won,,Unknown,/);
+  assert.match(lines[1], /^1',1,00:30,Tackle,,Unknown,/);
   assert.match(lines[2], /^2',1,01:30,Header won,5,"Kev ""The Wall"", Jr",0.25,0.5$/);
 });
 
@@ -303,12 +303,18 @@ test("opposition events are tallied apart from ours", () => {
   assert.equal(S.seasonTally(st).total.yellow, 1);
 });
 
-test("events are grouped good then bad for the team, with stable ids", () => {
-  const good = S.EVENT_TYPES.filter((t) => t.positive).map((t) => t.id);
-  const bad = S.EVENT_TYPES.filter((t) => !t.positive).map((t) => t.id);
-  assert.deepEqual(good, ["tackle_won", "broken_won", "air_won", "save", "shot_on", "goal"]);
-  assert.deepEqual(bad, ["broken_lost", "air_lost", "shot_off", "yellow"]);
-  assert.equal(S.eventType("yellow").label, "Yellow card");
+test("events: attack and defend, each alphabetical; old types retired but readable", () => {
+  const labels = (side) => S.eventButtons(side).map((t) => t.label);
+  assert.deepEqual(labels("attack"), ["Assist", "Cross", "Goal", "Pass", "Shot", "Shot off target", "Shot on target", "Throw in"]);
+  assert.deepEqual(labels("defend"), ["Broken ball lost", "Broken ball won", "Clearance", "Foul", "Header won", "Interception", "Tackle", "Yellow card"]);
+  for (const side of ["attack", "defend"]) {
+    const l = labels(side);
+    assert.deepEqual(l, [...l].sort((a, b) => a.localeCompare(b)));
+  }
+  // Save and Header lost are no longer offered, but games that used them still show them.
+  assert.equal(S.eventType("save").retired, true);
+  assert.equal(S.statTypes([]).some((t) => t.id === "save"), false);
+  assert.equal(S.statTypes([{ type: "save" }]).some((t) => t.id === "save"), true);
 });
 
 test("version 3 goals conceded become opposition Goal events", () => {
@@ -386,4 +392,80 @@ test("reset clears the match but keeps the game's details and team sheet", () =>
   Object.assign(g, cleared); // undo
   assert.equal(S.phase(g), "first");
   assert.deepEqual(S.score(g), { us: 1, them: 0 });
+});
+
+test("pausing stops the clock; resuming continues it; minutes follow", () => {
+  const st = S.emptyState();
+  const a = S.addPlayer(st, "1", "A").player;
+  const g = S.createGame(st, { opponent: "R", halfLength: 30 }).game;
+  S.setOnPitch(st, g, [a.id], 0);
+  S.advancePhase(g, 0);
+  assert.ok(S.pauseClock(g, 5 * MIN));
+  assert.equal(S.pauseClock(g, 6 * MIN), false); // already paused
+  const c = S.clock(g, 9 * MIN);
+  assert.deepEqual([c.seconds, c.paused, c.running], [300, true, false]);
+  assert.ok(S.resumeClock(g, 10 * MIN));
+  assert.equal(S.clock(g, 12 * MIN).seconds, 420); // 5 + 2 minutes
+  // Half time while paused closes the pause; undo reopens it.
+  S.pauseClock(g, 13 * MIN);
+  S.advancePhase(g, 20 * MIN);
+  assert.equal(S.clock(g, 99 * MIN).seconds, 480);
+  S.undoPhase(g);
+  assert.equal(S.isPaused(g), true);
+  assert.equal(S.playingTime(g, 25 * MIN).get(a.id), 480);
+});
+
+test("restarting a half puts the clock back to its start, with undo", () => {
+  const st = S.emptyState();
+  const g = S.createGame(st, { opponent: "R", halfLength: 30 }).game;
+  assert.equal(S.restartHalf(g, 0), null); // nothing running
+  S.advancePhase(g, 0);
+  S.pauseClock(g, MIN);
+  const old = S.restartHalf(g, 3 * MIN);
+  assert.equal(S.clock(g, 4 * MIN).seconds, 60);
+  assert.equal(S.isPaused(g), false);
+  Object.assign(g.periods[0], old); // undo
+  assert.equal(S.isPaused(g), true);
+  assert.equal(S.clock(g, 4 * MIN).seconds, 60);
+});
+
+test("possession: time per team, per half, ignoring time out of play", () => {
+  const st = S.emptyState();
+  const g = S.createGame(st, { opponent: "R", halfLength: 10 }).game;
+  S.advancePhase(g, 0);
+  assert.equal(S.possessionNow(g), null);
+  S.setPossession(st, g, "us", 0);
+  S.setPossession(st, g, "them", 3 * MIN);
+  S.setPossession(st, g, null, 4 * MIN); // ball out
+  S.setPossession(st, g, "us", 5 * MIN);
+  S.advancePhase(g, 10 * MIN); // half time
+  S.advancePhase(g, 12 * MIN);
+  assert.equal(S.possessionNow(g), null); // fresh for the 2nd half
+  S.setPossession(st, g, "them", 12 * MIN);
+  S.advancePhase(g, 14 * MIN);
+  const t = S.possessionTime(g);
+  assert.deepEqual(t.half[1], { us: 8 * 60, them: 60 });
+  assert.deepEqual(t.half[2], { us: 0, them: 120 });
+  assert.deepEqual(S.possessionPercent(t), { us: 73, them: 27 });
+  assert.equal(S.possessionPercent({ us: 0, them: 0 }), null);
+  assert.throws(() => S.setPossession(st, g, "ref"), /Unknown team/);
+});
+
+test("team name is required, stamped on new games, and round-trips", () => {
+  assert.match(S.teamNameError(" "), /team's name/);
+  assert.match(S.teamNameError("x".repeat(41)), /under 40/);
+  assert.equal(S.teamNameError("Ballyhale U12"), null);
+  const st = S.emptyState();
+  st.teamName = "Ballyhale U12";
+  const g = S.createGame(st, { opponent: "Rovers", halfLength: 30 }).game;
+  assert.equal(S.matchTitle(g, "Renamed"), "Ballyhale U12 vs Rovers");
+  delete g.team;
+  assert.equal(S.matchTitle(g, "Renamed"), "Renamed vs Rovers");
+  g.team = "Ballyhale U12";
+  S.advancePhase(g, 0);
+  S.pauseClock(g, MIN);
+  S.setPossession(st, g, "us", 0);
+  const back = S.parseState(JSON.stringify(S.toExport(st)));
+  assert.equal(back.teamName, "Ballyhale U12");
+  assert.deepEqual(back.games[0], g);
 });

@@ -12,10 +12,16 @@ async function addSquad(page, text = SQUAD) {
 
 async function newGame(page, opponent = "Rovers", half = "30") {
   await page.goto("./#/new");
+  // A team name is required before the first game.
+  await expect(page.locator("#opponent, #save-team-name").first()).toBeVisible();
+  if (await page.locator("#save-team-name").isVisible()) {
+    await page.locator("#team-name").fill("Our Team");
+    await page.locator("#save-team-name").click();
+  }
   await page.locator("#opponent").fill(opponent);
   await page.locator("#half-length").fill(half);
   await page.locator("#create-game").click();
-  await expect(page.locator(".live-head .opp")).toContainText(`vs ${opponent}`);
+  await expect(page.locator(".live-title .opp")).toContainText(`vs ${opponent}`);
 }
 
 /** Taps the pitch at a fraction of its width/height (0,0 = top-left, our goal on the left). */
@@ -27,11 +33,11 @@ async function tapPitch(page, fx, fy) {
   await pitch.click({ position: { x: ((1 + fx * 105) / 107) * box.width, y: ((1 + fy * 68) / 70) * box.height } });
 }
 
-/** Start game: the lineup prompt appears first; pick "Everyone on" unless told otherwise. */
+/** Start game: the lineup prompt appears first; pick everyone unless told otherwise. */
 async function kickOff(page, { everyone = true } = {}) {
   await page.locator("#phase-btn").click();
   await expect(page.locator("#dialog-title")).toHaveText("Who's starting?");
-  if (everyone) await page.getByRole("button", { name: "Everyone on" }).click();
+  if (everyone) await page.locator("#select-all").click();
   await page.locator("#dialog-ok").click();
   await expect(page.locator("#phase-label")).toHaveText("1st half");
 }
@@ -107,10 +113,10 @@ test("live: three taps in any order record an event, with undo", async ({ page }
   await ev(page, "tackle_won").click();
   await tapPitch(page, 0.2, 0.3);
   await expect(page.locator("#recent li")).toHaveCount(2);
-  await expect(page.locator("#recent li").first()).toContainText("Tackle won");
+  await expect(page.locator("#recent li").first()).toContainText("Tackle");
 
   // Unknown player works; undo removes it.
-  await ev(page, "air_lost").click();
+  await ev(page, "foul").click();
   await pl(page, "unknown").click();
   await tapPitch(page, 0.5, 0.5);
   await expect(page.locator("#recent li").first()).toContainText("Unknown");
@@ -132,6 +138,8 @@ test("live: three taps in any order record an event, with undo", async ({ page }
 
 test("team sheet: per-game numbers, who's playing, and a late addition", async ({ page }) => {
   await addSquad(page, "1 Sam\n7 Jamie\n9 Jordan\n10 Lee");
+  await page.locator("#team-name").fill("Our Team");
+  await page.locator("#save-team-name").click();
   await page.goto("./#/new");
   await page.locator("#opponent").fill("Rovers");
   // Lee is away; Jordan wears 14 today.
@@ -206,8 +214,8 @@ test("lineup, substitutions and minutes played", async ({ page }) => {
   // Kick-off asks who's starting: everyone but #12.
   await page.locator("#phase-btn").click();
   await expect(page.locator("#dialog-title")).toHaveText("Who's starting?");
-  for (const n of [1, 2, 3]) await page.locator(`#sub-bench .sub-chip[data-number="${n}"]`).click();
-  await expect(page.locator("#sub-on .sub-chip")).toHaveCount(3);
+  for (const n of [1, 2, 3]) await page.locator(`#start-grid .sub-chip[data-number="${n}"]`).click();
+  await expect(page.locator("#start-count")).toHaveText("Starting: 3");
   await page.locator("#dialog-ok").click();
   await expect(page.locator("#phase-label")).toHaveText("1st half");
   await expect(page.locator('.pl-btn[data-number="12"]')).toHaveClass(/bench/);
@@ -216,10 +224,11 @@ test("lineup, substitutions and minutes played", async ({ page }) => {
   // 20:00 in, #12 on for #2.
   await at("20:00");
   await page.locator("#subs-btn").click();
-  await expect(page.locator('#sub-on .sub-chip[data-number="2"] .mins')).toHaveText("20'");
-  await page.locator('#sub-on .sub-chip[data-number="2"]').click();
-  await page.locator('#sub-bench .sub-chip[data-number="12"]').click();
-  await expect(page.locator("#dialog")).toContainText("1 off, 1 on");
+  await expect(page.locator('#sub-off-grid .sub-chip[data-number="2"] .mins')).toHaveText("20'");
+  await expect(page.locator("#dialog-ok")).toBeDisabled(); // nothing picked yet
+  await page.locator('#sub-off-grid .sub-chip[data-number="2"]').click();
+  await page.locator('#sub-on-grid .sub-chip[data-number="12"]').click();
+  await expect(page.locator("#sub-summary")).toContainText("#2 Alex → #12 Sub");
   await page.locator("#dialog-ok").click();
   await expect(page.locator("#live-status")).toContainText("Sub 21' · on #12 · off #2");
   await expect(page.locator('.pl-btn[data-number="2"]')).toHaveClass(/bench/);
@@ -276,7 +285,7 @@ test("opposition stats and yellow cards show separately in game stats", async ({
   await log("yellow", "them", 0.6, 0.3);
   await log("shot_on", "them", 0.1, 0.5);
   await log("tackle_won", 9, 0.5, 0.5);
-  await expect(page.locator("#recent li").first()).toContainText("Tackle won");
+  await expect(page.locator("#recent li").first()).toContainText("Tackle");
   await expect(page.locator("#recent li").nth(1)).toContainText("Them");
 
   await page.locator("#to-stats").click();
@@ -290,11 +299,12 @@ test("opposition stats and yellow cards show separately in game stats", async ({
   await expect(page.locator("#stats-pitch .sym-card")).toHaveCount(2);
 });
 
-test("buttons are grouped good / bad for the team", async ({ page }) => {
+test("events are in Attack and Defend blocks, alphabetical", async ({ page }) => {
   await addSquad(page);
   await newGame(page);
-  await expect(page.locator(".events.good .ev-btn")).toHaveText(["Tackle won", "Broken ball won", "Header won", "Save", "Shot on target", "Goal"]);
-  await expect(page.locator(".events.bad .ev-btn")).toHaveText(["Broken ball lost", "Header lost", "Shot off target", "Yellow card"]);
+  await expect(page.locator(".events.attack .ev-btn")).toHaveText(["Assist", "Cross", "Goal", "Pass", "Shot", "Shot off target", "Shot on target", "Throw in"]);
+  await expect(page.locator(".events.defend .ev-btn")).toHaveText(["Broken ball lost", "Broken ball won", "Clearance", "Foul", "Header won", "Interception", "Tackle", "Yellow card"]);
+  await expect(page.locator(".live-title .opp")).toHaveText("Our Team vs Rovers");
 });
 
 test("broken ball won and lost are logged like other events", async ({ page }) => {
@@ -375,7 +385,7 @@ test("stats: totals, per-player table, map filters and CSV", async ({ page }) =>
   await expect(page.locator("tbody tr")).toHaveText([/#4 Chris.*2/, /#9 Jordan/, /Unknown/]);
 
   // Hide tackles on the map; then focus on #9.
-  await page.locator(".chip", { hasText: "Tackle won" }).click();
+  await page.locator(".chip", { hasText: /^Tackle$/ }).click();
   await expect(page.locator("#stats-pitch .mark")).toHaveCount(3);
   await page.locator("tbody tr", { hasText: "#9 Jordan" }).click();
   await expect(page.locator("#stats-pitch .mark")).toHaveCount(2);
@@ -386,7 +396,7 @@ test("stats: totals, per-player table, map filters and CSV", async ({ page }) =>
   expect(dl.suggestedFilename()).toMatch(/-vs-Rovers\.csv$/);
   const csv = fs.readFileSync(await dl.path(), "utf8").trim().split("\n");
   expect(csv.slice(0, csv.indexOf(""))).toHaveLength(6); // header + 5 events, then score and minutes
-  expect(csv[1]).toContain("Tackle won,4,Chris");
+  expect(csv[1]).toContain("Tackle,4,Chris");
   expect(csv).toContain("Score,0-0");
 
   // Season totals appear on the games list.
@@ -483,6 +493,7 @@ test("warns when browser storage is unavailable", async ({ page }) => {
 });
 
 test.describe("accounts", () => {
+  test.beforeEach(() => test.slow()); // several "phones" syncing through one emulator
   test.use({ signIn: false });
 
   test("signed-out visitors see only the sign-in screen", async ({ page }) => {
@@ -566,6 +577,7 @@ test.describe("accounts", () => {
 });
 
 test.describe("signing out and sharing a team", () => {
+  test.beforeEach(() => test.slow()); // several "phones" syncing through one emulator
   test.use({ signIn: false });
 
   test("sign out from the Account tab or the Games screen", async ({ page, email }) => {
@@ -636,6 +648,7 @@ test.describe("signing out and sharing a team", () => {
 });
 
 test.describe("coaches and per-game editors", () => {
+  test.beforeEach(() => test.slow()); // several "phones" syncing through one emulator
   test.use({ signIn: false });
 
   /** Opens a second signed-in "phone" for another coach. */
@@ -681,7 +694,7 @@ test.describe("coaches and per-game editors", () => {
     const row = coach.locator("#co-list li", { hasText: opponent });
     await expect(row).toHaveCount(1);
     await row.locator("a").click();
-    await expect(coach.locator(".live-head .opp")).toContainText(opponent);
+    await expect(coach.locator(".live-title .opp")).toContainText(opponent);
     // Owner-only controls are hidden for an editor.
     await expect(coach.getByRole("button", { name: "Players", exact: true })).toHaveCount(0);
 
@@ -716,7 +729,7 @@ test.describe("coaches and per-game editors", () => {
 test("the Help tab explains the essentials", async ({ page }) => {
   await page.getByRole("link", { name: "Help" }).click();
   await expect(page.locator("#help h1")).toHaveText("Help");
-  await expect(page.locator("#help summary")).toHaveCount(7);
+  await expect(page.locator("#help summary")).toHaveCount(8);
   await page.locator("#help summary", { hasText: "Share with other coaches" }).click();
   await expect(page.locator("#help")).toContainText("Coaches who can edit this game");
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
@@ -774,6 +787,7 @@ test("reset from a game's stats page", async ({ page }) => {
 });
 
 test("a change made just before closing the app isn't lost", async ({ page }) => {
+  test.slow(); // waits for a full reconnect after reloading
   await addSquad(page);
   await newGame(page, "Quick Close");
   await ev(page, "goal").click();
@@ -783,4 +797,170 @@ test("a change made just before closing the app isn't lost", async ({ page }) =>
   await expect(page.locator("body")).toHaveAttribute("data-sync", "ready");
   await page.goto("./#/games");
   await expect(page.locator(".list li", { hasText: "vs Quick Close" })).toContainText("1–0");
+});
+
+test("team name is required before the first game", async ({ page }) => {
+  await page.goto("./#/new");
+  await expect(page.locator("#save-team-name")).toBeVisible();
+  await page.locator("#save-team-name").click();
+  await expect(page.locator("#team-name-error")).toHaveText("Enter your team's name");
+  await page.locator("#team-name").fill("Ballyhale U12");
+  await page.locator("#save-team-name").click();
+  await expect(page.locator("#opponent")).toBeVisible();
+  await page.locator("#opponent").fill("Rovers");
+  await page.locator("#create-game").click();
+  await expect(page.locator(".live-title .opp")).toHaveText("Ballyhale U12 vs Rovers");
+  await page.goto("./#/games");
+  await expect(page.locator(".list li").first()).toContainText("Ballyhale U12 vs Rovers");
+  await page.goto("./#/squad");
+  await expect(page.locator("h1")).toHaveText("Ballyhale U12");
+});
+
+test("possession: tap who has the ball; percentages follow the clock", async ({ page }) => {
+  const at = await useMatchTime(page);
+  await addSquad(page);
+  await newGame(page);
+  await expect(page.locator("#poss-us")).toBeDisabled(); // not until kick-off
+  await kickOff(page);
+  await page.locator("#poss-us").click();
+  await expect(page.locator("#poss-us")).toHaveAttribute("aria-pressed", "true");
+  await at("03:00");
+  await page.locator("#poss-them").click();
+  await at("01:00");
+  await page.locator("#poss-them").click(); // ball out: nobody
+  await expect(page.locator("#poss-them")).toHaveAttribute("aria-pressed", "false");
+  await at("05:00");
+  await expect(page.locator("#poss-pct")).toHaveText("75% – 25%");
+  await page.locator("#to-stats").click();
+  await expect(page.locator("#poss-summary")).toContainText("75%");
+});
+
+test("the clock button pauses, restarts the half, and undoes kick-off", async ({ page }) => {
+  const at = await useMatchTime(page);
+  await addSquad(page);
+  await newGame(page);
+  await kickOff(page);
+  await at("02:00");
+  await page.locator("#clock-btn").click();
+  await page.locator("#pause-btn").click();
+  await expect(page.locator("#phase-label")).toHaveText("Paused");
+  await at("05:00");
+  await expect(page.locator("#clock")).toHaveText("02:00");
+  await page.locator("#clock-btn").click();
+  await page.locator("#pause-btn").click(); // resume
+  await at("00:30");
+  await expect(page.locator("#clock")).toHaveText("02:30");
+
+  // Misclicked kick-off: restart the half from 00:00.
+  await page.locator("#clock-btn").click();
+  await page.locator("#restart-half").click();
+  await expect(page.locator("#clock")).toHaveText("00:00");
+  await expect(page.locator("#live-status")).toContainText("1st half restarted");
+
+  // Or undo kick-off entirely.
+  await page.locator("#clock-btn").click();
+  await page.locator("#undo-step").click();
+  await expect(page.locator("#phase-btn")).toHaveText("Start game");
+});
+
+test.describe("admins, coaches and players", () => {
+  test.beforeEach(() => test.slow()); // several "phones" syncing through one emulator
+  test.use({ signIn: false });
+
+  async function phone(browser, page, email, opts) {
+    const ctx = await browser.newContext({ ...test.info().project.use });
+    const p2 = await ctx.newPage();
+    await p2.addInitScript(() => { window.__SIDELINE_EMULATOR = true; });
+    await p2.goto(new URL("./", page.url()).href);
+    await signInAs(p2, email, opts);
+    return { ctx, page: p2 };
+  }
+
+  test("an admin adds a coach, makes them admin, and removes them; coaches don't see Admin", async ({ page, browser }) => {
+    const admin = freshEmail("admin");
+    await allow(admin, { role: "admin", name: "Boss" });
+    await page.goto("./");
+    await signInAs(page, admin);
+    await expect(page.getByRole("link", { name: "Admin" })).toBeVisible();
+    await page.getByRole("link", { name: "Admin" }).click();
+
+    const coach = freshEmail("newcoach");
+    await page.locator("#admin-email").fill(coach.toUpperCase()); // stored lowercase
+    await page.locator("#admin-name").fill("New Coach");
+    await page.locator("#admin-add").click();
+    const row = page.locator(`#coach-list li[data-email="${coach}"]`);
+    await expect(row).toContainText("New Coach");
+    await expect(page.locator("#toast")).toContainText("Added"); // confirmed by the server
+
+    // The new coach can sign in, and has no Admin tab.
+    const { ctx, page: other } = await phone(browser, page, coach);
+    await expect(other.getByRole("link", { name: "Admin" })).toBeHidden();
+    await other.goto(new URL("./#/admin", page.url()).href);
+    await expect(other.locator("#admin")).toHaveCount(0);
+
+    await row.getByRole("button", { name: /Make admin/ }).click();
+    await expect(page.locator(`#admins li[data-email="${coach}"]`)).toHaveCount(1);
+    // You can't remove or demote yourself.
+    await expect(page.locator(`#admins li[data-email="${admin}"] button`)).toHaveCount(0);
+
+    await page.locator(`#admins li[data-email="${coach}"]`).getByRole("button", { name: `Remove ${coach}`, exact: true }).click();
+    await page.locator("#dialog-ok").click();
+    await expect(page.locator(`li[data-email="${coach}"]`)).toHaveCount(0);
+    await ctx.close();
+  });
+
+  test("a coach adds a player, who can only view that coach's games and stats", async ({ page, browser }) => {
+    test.setTimeout(90_000);
+    const coach = freshEmail("coach");
+    await allow(coach);
+    await page.goto("./");
+    await signInAs(page, coach);
+    await addSquad(page, "9 Jordan");
+    await newGame(page, "Player View FC");
+    await ev(page, "goal").click();
+    await pl(page, 9).click();
+    await tapPitch(page, 0.95, 0.5);
+
+    const player = freshEmail("player");
+    await page.goto("./#/data");
+    await page.locator("#player-email").fill(player);
+    await page.locator("#player-name").fill("Jordan");
+    await page.locator("#add-player-login").click();
+    await expect(page.locator("#my-players")).toContainText("Jordan");
+    await expect(page.locator("#toast")).toContainText("can now view your team"); // confirmed by the server
+
+    const { ctx, page: kid } = await phone(browser, page, player);
+    // Only Games, Help and Account.
+    await expect(kid.getByRole("link", { name: "Squad" })).toBeHidden();
+    await expect(kid.getByRole("link", { name: "Admin" })).toBeHidden();
+    await expect(kid.locator("h1")).toHaveText("Our Team");
+    const game = kid.locator("#team-games li", { hasText: "Player View FC" });
+    await expect(game).toContainText("1–0");
+    await game.locator("a").click();
+    await expect(kid.locator("#stats-score")).toHaveText("1–0");
+    for (const name of ["Edit details", "Delete game", "Reset game"]) await expect(kid.getByRole("button", { name })).toHaveCount(0);
+    await expect(kid.locator("#share-toggle, #editors")).toHaveCount(0);
+    // Trying to go elsewhere lands back on their team.
+    for (const route of ["#/new", "#/squad", "#/admin", "#/game/1"]) {
+      await kid.goto(new URL(`./${route}`, page.url()).href);
+      await expect(kid.locator("#team-games")).toBeVisible();
+    }
+    // Live: a new goal shows up for the player.
+    await page.goto("./#/games");
+    await page.locator(".list li", { hasText: "Player View FC" }).locator("a.main").click();
+    await ev(page, "goal").click();
+    await pl(page, 9).click();
+    await tapPitch(page, 0.9, 0.4);
+    await expect(game).toContainText("2–0");
+
+    // Removing the player locks them out.
+    await page.goto("./#/data");
+    await page.getByRole("button", { name: `Remove ${player}` }).click();
+    await page.locator("#dialog-ok").click();
+    await expect(page.locator("#toast")).toContainText("Removed"); // confirmed by the server
+    // Locked out at the next check (every minute, or on reopening): reopen now.
+    await kid.reload();
+    await expect(kid.locator("#gate")).toHaveAttribute("data-access", "denied");
+    await ctx.close();
+  });
 });
