@@ -495,18 +495,26 @@ export const formatMinutes = (seconds) => `${Math.floor((seconds ?? 0) / 60)}'`;
 
 // ---------------------------------------------------------------- possession
 
+/**
+ * A half's possession changes in the order they were tapped. Each change carries
+ * seq = one more than any change the phone had seen, so the latest tap wins even
+ * when phones' clocks disagree or the half was restarted (clock times can't order
+ * those). Changes made at the same moment on two phones tie on seq; time then id decide.
+ */
+const possessionChanges = (game, half) => (game.possession ?? []).filter((x) => x.half === half)
+  .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0) || a.t - b.t || a.id - b.id);
+
 /** Who has the ball now: "us" | "them" | null (unknown, or out of play). Resets each half. */
 export function possessionNow(game) {
-  const c = clock(game);
-  const changes = (game.possession ?? []).filter((x) => x.half === c.half).sort((a, b) => a.t - b.t || a.id - b.id);
-  return changes.at(-1)?.team ?? null;
+  return possessionChanges(game, clock(game).half).at(-1)?.team ?? null;
 }
 
 /** Records a change of possession at the current clock time. team null = nobody (ball out). */
 export function setPossession(state, game, team, now = Date.now()) {
   if (team !== "us" && team !== "them" && team !== null) throw new Error(`Unknown team ${team}`);
   const c = clock(game, now);
-  const change = { id: newId(state), half: c.half, t: c.seconds, team };
+  const seq = 1 + Math.max(0, ...(game.possession ?? []).map((x) => x.seq ?? 0));
+  const change = { id: newId(state), half: c.half, t: c.seconds, team, seq };
   (game.possession ??= []).push(change);
   return change;
 }
@@ -526,7 +534,7 @@ export function possessionTime(game, now = Date.now()) {
     if (!period) break;
     const start = (half - 1) * game.halfLength * 60;
     const end = start + halfElapsed(period, now);
-    const changes = (game.possession ?? []).filter((x) => x.half === half).sort((a, b) => a.t - b.t || a.id - b.id);
+    const changes = possessionChanges(game, half);
     changes.forEach((x, i) => {
       if (!x.team) return;
       const from = Math.min(Math.max(x.t, start), end);
@@ -742,7 +750,7 @@ export function parseState(text) {
     const subs = (g.subs ?? []).map((x) => ({ ...timed(x, "substitution"), on: known(x.on, "substitution"), off: known(x.off, "substitution") }));
     const possession = (g.possession ?? []).map((x) => {
       if (x?.team !== "us" && x?.team !== "them" && x?.team !== null) throw new Error(`Game ${g.id} has an invalid possession change.`);
-      return { ...timed(x, "possession change"), team: x.team };
+      return { ...timed(x, "possession change"), team: x.team, ...(Number.isInteger(x.seq) && x.seq > 0 ? { seq: x.seq } : {}) };
     });
     // Version 3 kept goals conceded in their own list; they're now opposition Goal events.
     for (const x of g.conceded ?? []) {

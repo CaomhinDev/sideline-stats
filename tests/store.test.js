@@ -451,6 +451,31 @@ test("possession: time per team, per half, ignoring time out of play", () => {
   assert.throws(() => S.setPossession(st, g, "ref"), /Unknown team/);
 });
 
+test("possession: the latest tap wins, even when phones' clocks disagree or the half restarts", () => {
+  const st = S.emptyState();
+  const g = S.createGame(st, { opponent: "R", halfLength: 30 }).game;
+  S.advancePhase(g, 0);
+  // Phone A's clock runs 5s ahead of phone B's. A taps Them; 2s later B (having synced) taps Us.
+  S.setPossession(st, g, "them", 100_000 + 5000);
+  S.setPossession(S.emptyState(), g, "us", 102_000);
+  assert.equal(S.possessionNow(g), "us");
+  // And back again from A.
+  S.setPossession(st, g, "them", 104_000 + 5000);
+  assert.equal(S.possessionNow(g), "them");
+  // Restarting the half sends the clock back to 0; new taps still win.
+  S.restartHalf(g, 200_000);
+  S.setPossession(st, g, "us", 201_000);
+  assert.equal(S.possessionNow(g), "us");
+  // Two taps in the same second, over and back.
+  S.setPossession(st, g, "them", 202_000);
+  S.setPossession(st, g, "us", 202_100);
+  S.setPossession(st, g, "them", 202_200);
+  assert.equal(S.possessionNow(g), "them");
+  // Tap order survives saving and loading.
+  const back = S.parseState(JSON.parse(JSON.stringify(st.games.length ? st : { ...st, games: [g] })));
+  assert.equal(S.possessionNow(back.games.find((x) => x.id === g.id)), "them");
+});
+
 test("team name is required, stamped on new games, and round-trips", () => {
   assert.match(S.teamNameError(" "), /team's name/);
   assert.match(S.teamNameError("x".repeat(41)), /under 40/);
