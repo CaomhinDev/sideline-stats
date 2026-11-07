@@ -426,7 +426,7 @@ test("cleared browser storage comes back from the account; export/import moves d
   await page.locator("#import-file").setInputFiles(file);
   await expect(page.locator("#dialog")).toContainText("12 players and 1 game");
   await page.locator("#dialog-ok").click();
-  await expect(page.locator(".list li")).toContainText("vs Rovers");
+  await expect(page.locator(".list li", { hasText: "vs Rovers" })).toHaveCount(1);
 });
 
 test("no backup nagging when signed in (the account is the backup)", async ({ page }) => {
@@ -771,4 +771,16 @@ test("reset from a game's stats page", async ({ page }) => {
   await page.locator("#reset-game").click();
   await page.locator("#dialog-ok").click();
   await expect(page.locator('[data-total="tackle_won"]')).toHaveText("0");
+});
+
+test("a change made just before closing the app isn't lost", async ({ page }) => {
+  await addSquad(page);
+  await newGame(page, "Quick Close");
+  await ev(page, "goal").click();
+  await pl(page, 9).click();
+  await tapPitch(page, 0.95, 0.5);
+  await page.reload(); // straight away, before Firebase may have confirmed
+  await expect(page.locator("body")).toHaveAttribute("data-sync", "ready");
+  await page.goto("./#/games");
+  await expect(page.locator(".list li", { hasText: "vs Quick Close" })).toContainText("1–0");
 });

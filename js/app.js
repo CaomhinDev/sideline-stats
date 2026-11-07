@@ -99,10 +99,29 @@ let inFlight = 0;
 let heldBack = null;
 let heldBackCo = null;
 
+/**
+ * Changes Firebase hasn't confirmed yet are noted on the phone (meta.pending),
+ * so if the app is closed or reloaded first, the phone's copy wins next time
+ * and the changes (including deleted games) are sent again.
+ */
+function notePending(deletedDocId) {
+  const uid = app.user.uid;
+  const p = app.meta.pending?.[uid] ?? { dirty: false, deleted: [] };
+  p.dirty = true;
+  if (deletedDocId && !p.deleted.includes(deletedDocId)) p.deleted.push(deletedDocId);
+  app.meta.pending = { ...app.meta.pending, [uid]: p };
+  saveMeta();
+}
+
 function track(promise) {
   inFlight++;
+  const uid = app.user?.uid;
   promise.catch(syncFailed).finally(() => {
     inFlight--;
+    if (inFlight === 0 && uid && app.user?.uid === uid && app.meta.pending?.[uid]) {
+      delete app.meta.pending[uid]; // everything confirmed
+      saveMeta();
+    }
     if (inFlight === 0) {
       if (heldBack) { const args = heldBack; heldBack = null; receive(...args); }
       if (heldBackCo) { const list = heldBackCo; heldBackCo = null; receiveEditable(list); }
@@ -135,6 +154,7 @@ function pushChanges() {
   const players = JSON.stringify({ players: app.state.players, teamShared });
   if (players !== sent.players) {
     sent.players = players;
+    notePending();
     track(cloud.saveUser(app.user, { players: app.state.players, shared: teamShared }));
   }
   const live = new Set();
@@ -145,10 +165,12 @@ function pushChanges() {
     const topJson = stable(top);
     const prev = sent.games.get(docId);
     if (!prev) {
+      notePending();
       track(cloud.saveGame(app.user, g, top.names, top.shared));
     } else {
       const ops = gameOps(prev.game, g);
       if (topJson !== prev.top) ops.unshift(top);
+      if (ops.length) notePending();
       for (const fields of ops) track(cloud.updateGame(docId, fields));
     }
     sent.games.set(docId, { game: clone(g), top: topJson });
@@ -156,6 +178,7 @@ function pushChanges() {
   for (const docId of [...sent.games.keys()]) {
     if (!live.has(docId)) {
       sent.games.delete(docId);
+      notePending(docId);
       track(cloud.removeGame(uid, docId.slice(uid.length + 1)));
     }
   }
@@ -182,7 +205,9 @@ function receive(user, games, fromServer) {
     reconciled = true;
     document.body.dataset.sync = "ready";
     const cloudEmpty = !user && games.length === 0;
-    const unsynced = app.meta.unsynced?.[app.user.uid];
+    const uid = app.user.uid;
+    const pending = app.meta.pending?.[uid];
+    const unsynced = app.meta.unsynced?.[uid] || pending?.dirty;
     if (cloudEmpty) {
       // First sign-in: upload this phone's data (from before accounts, if that's all there is).
       const legacy = storage.loadLegacy();
@@ -197,12 +222,20 @@ function receive(user, games, fromServer) {
       return;
     }
     if (unsynced) {
-      // Changes made while Firebase couldn't load: keep them, and anything only in the cloud.
+      // Changes Firebase never confirmed (app closed too soon, or Firebase couldn't
+      // load): keep this phone's copy, add games that only exist in the cloud
+      // (another device), and send everything again, deletions included.
+      const deleted = new Set(pending?.deleted ?? []);
       const mine = new Set(app.state.games.map((g) => g.id));
-      app.state.games.push(...parseGames(games).filter((g) => !mine.has(g.id)));
-      app.meta.unsynced = { ...app.meta.unsynced, [app.user.uid]: false };
+      app.state.games.push(...parseGames(games).filter((g) => !mine.has(g.id) && !deleted.has(cloud.gameDocId(uid, g.id))));
+      app.meta.unsynced = { ...app.meta.unsynced, [uid]: false };
       saveMeta();
+      for (const docId of deleted) {
+        notePending(docId);
+        track(cloud.removeGame(uid, docId.slice(uid.length + 1)));
+      }
       pushChanges();
+      storage.saveState(app.state);
       render();
       return;
     }
