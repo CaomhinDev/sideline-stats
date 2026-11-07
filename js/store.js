@@ -587,6 +587,21 @@ export function seasonPlayingTime(state, now = Date.now()) {
   return total;
 }
 
+/** Games each player took part in (on the pitch, or logged doing something). */
+export function seasonAppearances(state, now = Date.now()) {
+  const games = new Map();
+  for (const g of state.games) {
+    const ids = new Set([...[...playingTime(g, now)].filter(([, s]) => s > 0).map(([id]) => id),
+      ...g.events.filter((e) => e.team !== "them" && e.playerId != null).map((e) => e.playerId)]);
+    for (const id of ids) games.set(id, (games.get(id) ?? 0) + 1);
+  }
+  return games;
+}
+
+/** Does an event type match a filter: "all", a side ("attack" / "defend"), or one type id? */
+export const typeMatches = (filter, type) =>
+  !filter || filter === "all" || filter === type || eventType(type)?.side === filter;
+
 const label = (number, name) => (number == null ? name || "?" : name ? `#${number} ${name}` : `#${number}`);
 
 /** Player as known across the season: usual number and name. */

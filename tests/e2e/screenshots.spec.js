@@ -1,4 +1,4 @@
-import { test, allow, signInAs } from "./fixtures.js";
+import { test, expect, allow, signInAs } from "./fixtures.js";
 
 test.use({ signIn: false });
 
@@ -70,6 +70,19 @@ for (const scheme of ["light", "dark"]) {
     await page.goto("./#/game/50/stats");
     await page.locator("#editors").scrollIntoViewIfNeeded();
     await shot("editors");
+    // Drilling in: tackles by #4, one picked in the timeline, scrolled so the map sticks.
+    await page.locator('tbody tr', { hasText: "#4 Pat" }).locator('td[data-type="tackle_won"]').click();
+    await page.locator("#show-all").click();
+    await page.locator('.totals [data-type="pass"]').click();
+    await page.locator("#timeline li").nth(1).click();
+    await expect(page.locator("#timeline li[aria-current=true]")).toHaveCount(1);
+    await page.evaluate(() => document.getElementById("timeline").scrollIntoView());
+    await shot("stats-drill");
+    await page.goto("./#/season");
+    await shot("season", true);
+    await page.locator("#season tbody tr").first().locator("a").click();
+    await page.locator("#timeline li").first().click();
+    await shot("season-player", true);
     await page.goto("./#/game/50");
     await page.locator("#subs-btn").click();
     await page.locator('#sub-off-grid .sub-chip[data-number="5"]').click();

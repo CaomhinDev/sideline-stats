@@ -384,13 +384,31 @@ test("stats: totals, per-player table, map filters and CSV", async ({ page }) =>
   await expect(page.locator("#stats-pitch .mark")).toHaveCount(5);
   await expect(page.locator("tbody tr")).toHaveText([/#4 Chris.*2/, /#9 Jordan/, /Unknown/]);
 
-  // Hide tackles on the map; then focus on #9.
-  await page.locator(".chip", { hasText: /^Tackle$/ }).click();
-  await expect(page.locator("#stats-pitch .mark")).toHaveCount(3);
-  await page.locator("tbody tr", { hasText: "#9 Jordan" }).click();
-  await expect(page.locator("#stats-pitch .mark")).toHaveCount(2);
-  await page.getByRole("button", { name: "Show everyone" }).click();
-  await expect(page.locator("#stats-pitch .mark")).toHaveCount(3);
+  const marks = page.locator("#stats-pitch .mark");
+  const timeline = page.locator("#timeline li");
+  // Tap a total: only tackles, on the map and the timeline. Again: everything.
+  await page.locator('.totals [data-type="tackle_won"]').click();
+  await expect(marks).toHaveCount(2);
+  await expect(timeline).toHaveCount(2);
+  await page.locator('.totals [data-type="tackle_won"]').click();
+  await expect(marks).toHaveCount(5);
+  // Tap a player: only theirs.
+  await page.locator("tbody tr", { hasText: "#9 Jordan" }).locator("td").first().click();
+  await expect(marks).toHaveCount(2);
+  await expect(timeline).toHaveCount(2);
+  await expect(page.locator("#timeline")).not.toContainText("Chris");
+  // Tap a number: that player and that stat.
+  await page.locator("tbody tr", { hasText: "#4 Chris" }).locator('td[data-type="tackle_won"]').click();
+  await expect(page.locator("#drill-summary")).toContainText("Tackle · #4 Chris · 2 events");
+  await expect(page.locator("tbody td.cell-sel")).toHaveText("2");
+  // Pick an event in the timeline: it's highlighted there and on the map.
+  await timeline.first().click();
+  await expect(page.locator("#timeline li[aria-current=true]")).toHaveCount(1);
+  await expect(page.locator("#stats-pitch .mark.selected")).toHaveCount(1);
+  await page.locator("#stats-pitch .mark").nth(0).click({ force: true }); // tapping the map picks too
+  await expect(page.locator("#stats-pitch .mark.selected")).toHaveCount(1);
+  await page.getByRole("button", { name: "Show all" }).click();
+  await expect(marks).toHaveCount(5);
 
   const [dl] = await Promise.all([page.waitForEvent("download"), page.getByRole("button", { name: "Download CSV" }).click()]);
   expect(dl.suggestedFilename()).toMatch(/-vs-Rovers\.csv$/);
@@ -399,9 +417,23 @@ test("stats: totals, per-player table, map filters and CSV", async ({ page }) =>
   expect(csv[1]).toContain("Tackle,4,Chris");
   expect(csv).toContain("Score,0-0");
 
-  // Season totals appear on the games list.
+  // Player stats across the season: leaders, a sortable table, and each player's page.
   await page.goto("./#/games");
-  await expect(page.getByRole("heading", { name: "Season totals" })).toBeVisible();
+  await page.locator("#season-link").click();
+  await expect(page.locator("#leaders li", { hasText: "Tackle" })).toContainText("#4 Chris 2");
+  await page.locator("#leaders li", { hasText: "Header won" }).click(); // rank by it
+  await expect(page.locator("#season tbody tr").first()).toContainText("#9 Jordan");
+  await page.locator('#season th[data-col="tackle_won"]').click();
+  await expect(page.locator("#season tbody tr").first()).toContainText("#4 Chris");
+  await page.locator("#season tbody tr", { hasText: "#4 Chris" }).locator("a").click();
+  await expect(page.locator("h1")).toHaveText("#4 Chris");
+  await expect(page.locator("#stats-pitch .mark")).toHaveCount(2);
+  await page.locator("#timeline li").first().click();
+  await expect(page.locator("#stats-pitch .mark.selected")).toHaveCount(1);
+  // A game from their list opens that game's stats, showing just them.
+  await page.locator("#player-games tbody tr").first().click();
+  await expect(page.locator("#drill-summary")).toContainText("#4 Chris");
+  await expect(page.locator("#stats-pitch .mark")).toHaveCount(2);
 });
 
 test("cleared browser storage comes back from the account; export/import moves data to another account", async ({ page }) => {
@@ -629,7 +661,9 @@ test.describe("signing out and sharing a team", () => {
     await expect(sis.locator("h1")).toHaveText("Our Team");
     await expect(sis.locator("#team-squad li")).toHaveText([/4\s*Chris/, /9\s*Jordan/]);
     await expect(sis.locator("#team-games li")).toContainText(opponent);
-    await expect(sis.locator("tbody")).toContainText("#9 Jordan");
+    await sis.locator("#season-link").click();
+    await expect(sis.locator("#season tbody")).toContainText("#9 Jordan");
+    await sis.goBack();
     await sis.locator("#team-games li a").first().click();
     await expect(sis.locator("h1")).toContainText(opponent);
     await expect(sis.getByRole("button", { name: "Delete game" })).toHaveCount(0);

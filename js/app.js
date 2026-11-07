@@ -33,7 +33,10 @@ const app = {
   allTeams: [], // for an admin: every team, [{ uid, teamName, ownerName }]
   route: { name: "games" },
   pending: null, // live entry: { gameId, x, y, type, playerId } – playerId undefined = not chosen, null = unknown
-  statsFilter: { half: 0, types: new Set(S.EVENT_IDS), playerId: undefined },
+  // Game stats drill-down: half, team, one event type or side ("all" | "attack" | "defend" | type id), one player, one picked event.
+  statsFilter: { half: 0, type: "all", playerId: undefined, team: "us", selected: null },
+  // Season stats: table sort, and the player page's type filter and picked event.
+  season: { key: null, sort: { col: "all", dir: 1 }, pkey: null, type: "all", selected: null },
 };
 
 function commit(mutate, { rerender = true } = {}) {
@@ -652,7 +655,13 @@ function parseRoute() {
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   if (parts[0] === "game" && parts[1]) return { name: parts[2] === "stats" ? "stats" : "live", id: Number(parts[1]) };
   if (parts[0] === "shared" && parts[1]) return { name: "shared", docId: decodeURIComponent(parts[1]) };
-  if (parts[0] === "team" && parts[1]) return { name: "team", uid: decodeURIComponent(parts[1]) };
+  if (parts[0] === "team" && parts[1]) {
+    const uid = decodeURIComponent(parts[1]);
+    if (parts[2] === "season") return { name: "team", uid, sub: "season" };
+    if (parts[2] === "player" && parts[3]) return { name: "team", uid, sub: "player", playerId: Number(parts[3]) };
+    return { name: "team", uid };
+  }
+  if (parts[0] === "season") return { name: "season", playerId: parts[1] ? Number(parts[1]) : undefined };
   if (parts[0] === "co" && parts[1]) return { name: parts[2] === "stats" ? "costats" : "co", docId: decodeURIComponent(parts[1]) };
   if (["games", "squad", "data", "new", "help", "admin"].includes(parts[0])) return { name: parts[0] };
   return { name: "games" };
@@ -699,7 +708,7 @@ function render() {
   const live = r.name === "live" || (r.name === "co" && !!coEntry);
   document.body.classList.toggle("live", live);
   document.getElementById("tabs").hidden = live;
-  const tab = ["new", "stats", "shared", "team", "co", "costats"].includes(r.name) ? "games" : r.name;
+  const tab = ["new", "stats", "shared", "team", "co", "costats", "season"].includes(r.name) ? "games" : r.name;
   const tabs = document.getElementById("tabs");
   tabs.dataset.role = app.role ?? "";
   tabs.querySelector('[data-tab="admin"]').hidden = app.role !== "admin";
@@ -712,7 +721,8 @@ function render() {
   const notEditable = () => h("section", {}, h("a", { class: "link-btn", href: "#/games" }, "‹ Games"),
     h("h1", {}, "Not available"), h("p", { class: "muted" }, "You can't edit this game (anymore). The coach who created it may have removed you."));
   const views = {
-    games: app.role === "player" ? viewPlayerHome : viewGames, admin: viewAdmin, new: viewNewGame, live: () => viewLive(game), stats: () => viewStats(game), shared: viewShared, team: viewTeam, squad: viewSquad, data: viewData, help: viewHelp,
+    games: app.role === "player" ? viewPlayerHome : viewGames, admin: viewAdmin, new: viewNewGame, live: () => viewLive(game), stats: () => viewStats(game), shared: viewShared, team: () => (r.sub ? viewTeamSeason(r) : viewTeam()), squad: viewSquad,
+    season: () => (r.playerId != null ? viewSeasonPlayer(ownSeason(), r.playerId) : viewSeason(ownSeason())), data: viewData, help: viewHelp,
     co: () => (coEntry ? viewLive(coEntry.game) : notEditable()),
     costats: () => (coEntry ? viewStats(coEntry.game, { st: coEntry.st, co: coEntry }) : notEditable()),
   };
@@ -819,8 +829,10 @@ function viewHelp() {
       [b("Reset game"), " clears the clock and events but keeps the team sheet. ", b("Delete game"), " removes it. Both are in the ", b("⋯"), " menu on Games, and can be undone straight after."])),
     section("5. See the stats", false, ul(
       ["Tap ", b("stats →"), " on a game: score, ", b("possession"), ", totals, a pitch map, and a table by player with minutes."],
-      ["Filter by half, team, or event type. Tap a player in the table to see only theirs."],
-      [b("Download CSV"), " opens in any spreadsheet. ", b("Season totals"), " are on the Games screen."])),
+      ["Tap a total, a player, a column or a number in the table to see just those on the map and timeline. Tap it again to show everything."],
+      ["Tap an event in the ", b("Timeline"), " (or on the map) to highlight it. The map stays in view while you scroll."],
+      [b("Player stats"), " (Games screen, under Season): leaders for every stat, a table you can sort by any column, and each player's games, map and timeline."],
+      [b("Download CSV"), " opens in any spreadsheet."])),
     section("6. Share with other coaches", false, ul(
       [b("One game, view only"), ": on its stats page, tick ", b("Share with coaches"), "."],
       [b("Your whole team, view only"), ": on ", b("Squad"), ", tick ", b("Share my team with coaches"), ". Covers every game, now and later."],
@@ -944,7 +956,6 @@ function viewTeam(uid = app.route.uid) {
   } catch {
     st = S.parseState({ players: team.players ?? [], games: [] });
   }
-  const season = S.seasonTally(st);
   const players = S.activePlayers(st);
   return h("section", {},
     app.role !== "player" && h("a", { class: "link-btn", href: "#/games" }, "‹ Games"),
@@ -961,7 +972,7 @@ function viewTeam(uid = app.route.uid) {
             h("span", { class: "badge" }, `${sc.us}–${sc.them} · ${PHASE_LABEL[S.phase(x.game)]}`));
         }))
       : h("p", { class: "muted" }, "No games yet."),
-    season.byPlayer.size > 0 && [h("h2", {}, "Season totals"), statsTable(season, { selectable: false, st, minutes: S.seasonPlayingTime(st) })],
+    games.length > 0 && h("a", { class: "btn btn-quiet btn-block", href: `#/team/${encodeURIComponent(team.uid)}/season`, id: "season-link", style: "margin-top:16px" }, "Player stats: leaders and totals →"),
     h("h2", {}, `Squad (${players.length})`),
     players.length
       ? h("ul", { class: "list", id: "team-squad" }, players.map((p) => h("li", {}, h("span", { class: "shirt" }, p.number), h("div", { class: "main" }, h("div", { class: "primary" }, p.name || h("span", { class: "muted" }, "(no name)"))))))
@@ -993,7 +1004,6 @@ const sharedGamesOnly = () => {
 function viewGames() {
   const st = app.state;
   const games = [...st.games].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : b.id - a.id));
-  const season = S.seasonTally(st);
   return h("section", {},
     h("h1", {}, "Games"),
     !S.activePlayers(st).length && h("div", { class: "card" },
@@ -1047,7 +1057,8 @@ function viewGames() {
             h("div", { class: "secondary" }, `${fmtDate(x.game.date)} · by ${x.ownerName || "another coach"}`)),
           h("span", { class: "badge" }, `${sc.us}–${sc.them} · ${PHASE_LABEL[S.phase(x.game)]}`));
       }))],
-    season.byPlayer.size > 0 && [h("h2", {}, "Season totals"), statsTable(season, { selectable: false, minutes: S.seasonPlayingTime(st) })],
+    st.games.length > 0 && [h("h2", {}, "Season"),
+      h("a", { class: "btn btn-quiet btn-block", href: "#/season", id: "season-link" }, "Player stats: leaders and totals →")],
     h("p", { class: "muted small signed-in-as" }, "Signed in as ", app.user?.email, " · ",
       h("button", { type: "button", class: "link-btn small", id: "games-sign-out", onclick: () => cloud?.signOut() }, "Sign out")));
 }
@@ -1292,13 +1303,16 @@ function afterPick(game) {
   }
 }
 
-function eventRow(game, e, { st = ctxFor(game).st, readOnly = false } = {}) {
-  return h("li", { "data-event-id": e.id },
+function eventRow(game, e, { st = ctxFor(game).st, readOnly = false, selected = false, onSelect = null, detail = null } = {}) {
+  return h("li", {
+    "data-event-id": e.id, class: onSelect ? "clickable" : null, "aria-current": selected ? "true" : null,
+    onclick: onSelect ? (ev) => { if (!ev.target.closest("button")) onSelect(e); } : null,
+  },
     h("span", { class: "muted small", style: "width:52px;flex:none;font-variant-numeric:tabular-nums" }, S.minuteLabel(e, game.halfLength)),
     symbolIcon(e.type, 18),
     h("div", { class: "main" },
       h("div", { class: "primary" }, S.eventType(e.type).label, e.team === "them" && h("span", { class: "badge them-badge" }, "Them")),
-      h("div", { class: "secondary" }, S.eventPlayerLabel(st, e))),
+      h("div", { class: "secondary" }, detail ?? S.eventPlayerLabel(st, e))),
     !readOnly && h("button", {
       type: "button", class: "link-btn", "aria-label": `Delete ${S.eventType(e.type).label} at ${S.minuteLabel(e, game.halfLength)}`,
       onclick: () => {
@@ -1490,7 +1504,7 @@ function rosterEditor(roster) {
 
 // ---- Pitch
 
-function pitchSvg({ marks, pending, onTap, label, highlight }) {
+function pitchSvg({ marks, pending, onTap, label, highlight, selected = null, onMark = null }) {
   const W = 105, H = 68;
   const stripes = Array.from({ length: 7 }, (_, i) => i % 2 && s("rect", { class: "stripe", x: i * 15, y: 0, width: 15, height: H }));
   const box = (x0, depth, width) => {
@@ -1515,9 +1529,13 @@ function pitchSvg({ marks, pending, onTap, label, highlight }) {
     s("path", { class: "line", d: `M16.5 ${H / 2 - 7.3} A9.15 9.15 0 0 1 16.5 ${H / 2 + 7.3}` }),
     s("path", { class: "line", d: `M${W - 16.5} ${H / 2 - 7.3} A9.15 9.15 0 0 0 ${W - 16.5} ${H / 2 + 7.3}` }),
     s("text", { class: "dir", x: W / 2 + 12, y: 4.5 }, "ATTACKING →"),
-    marks.map((e) => {
+    // The picked event is drawn last (on top), larger and ringed.
+    [...marks].sort((a, b) => (a.id === selected) - (b.id === selected)).map((e) => {
       const dim = highlight && !highlight(e);
-      return symbolShape(e.type, e.x * W, e.y * H, 1.7, { class: "mark", opacity: dim ? 0.25 : 1 });
+      const sel = selected != null && e.id === selected;
+      const mark = symbolShape(e.type, e.x * W, e.y * H, sel ? 2.6 : 1.7, { class: sel ? "mark selected" : "mark", opacity: dim ? 0.25 : 1, "data-event-id": e.id });
+      if (onMark) mark.addEventListener("click", () => onMark(e));
+      return sel ? [s("circle", { class: "sel-ring", cx: e.x * W, cy: e.y * H, r: 4.4 }), mark] : mark;
     }),
     pending && [
       s("circle", { class: "pending-ring", cx: pending.x * W, cy: pending.y * H, r: 3.4 }),
@@ -1544,15 +1562,36 @@ function pitchSvg({ marks, pending, onTap, label, highlight }) {
 function viewStats(game, { st = app.state, readOnly = false, sharedBy = null, co = null } = {}) {
   const owner = !readOnly && !co; // only the creator can share, pick editors, edit details or delete
   const f = app.statsFilter;
-  if (f.gameId !== game.id) Object.assign(f, { gameId: game.id, half: 0, types: new Set(S.EVENT_IDS), playerId: undefined, team: "us" });
+  if (f.gameId !== game.id) Object.assign(f, { gameId: game.id, half: 0, type: "all", playerId: undefined, team: "us", selected: null });
   const types = S.statTypes(game.events);
   const inHalf = game.events.filter((e) => !f.half || e.half === f.half);
   const t = S.tally(inHalf);
   const teamOf = (e) => e.team ?? "us";
-  const shown = inHalf.filter((e) => e.x != null && f.types.has(e.type)
+  const picked = inHalf.filter((e) => S.typeMatches(f.type, e.type)
     && (f.team === "all" || teamOf(e) === f.team)
-    && (f.playerId === undefined || (teamOf(e) === "us" && (e.playerId ?? "unknown") === f.playerId)));
+    && (f.playerId === undefined || (teamOf(e) === "us" && (e.playerId ?? "unknown") === f.playerId)))
+    .sort((a, b) => a.half - b.half || a.t - b.t || a.id - b.id);
+  const shown = picked.filter((e) => e.x != null);
+  const selected = picked.some((e) => e.id === f.selected) ? f.selected : null;
   const c = S.clock(game);
+  // One tap filters the map and timeline; the same tap again clears it.
+  const pick = (playerId, type) => {
+    if (playerId !== undefined && type !== undefined) {
+      const same = f.playerId === playerId && f.type === type;
+      f.playerId = same ? undefined : playerId;
+      f.type = same ? "all" : type;
+    } else if (playerId !== undefined) {
+      f.playerId = f.playerId === playerId ? undefined : playerId;
+    } else if (type !== undefined) {
+      f.type = f.type === type ? "all" : type;
+    }
+    if (f.playerId !== undefined) f.team = "us";
+    f.selected = null;
+    render();
+  };
+  const select = (e) => { f.selected = f.selected === e.id ? null : e.id; render(); };
+  const what = f.type === "all" ? "All events" : f.type === "attack" ? "Attack events" : f.type === "defend" ? "Defend events" : S.eventType(f.type).label;
+  const who = f.playerId !== undefined ? S.gamePlayerLabel(st, game, f.playerId) : { us: "us", them: "the opposition", all: "both teams" }[f.team];
 
   return h("section", {},
     h("div", { class: "step", style: "margin:4px 0 12px" },
@@ -1566,29 +1605,31 @@ function viewStats(game, { st = app.state, readOnly = false, sharedBy = null, co
     owner && editorsPicker(game),
     h("div", { class: "chips", role: "group", "aria-label": "Half" },
       [["Both halves", 0], ["1st half", 1], ["2nd half", 2]].map(([label, v]) =>
-        h("button", { type: "button", class: "chip", "aria-pressed": String(f.half === v), onclick: () => { f.half = v; render(); } }, label))),
+        h("button", { type: "button", class: "chip", "aria-pressed": String(f.half === v), onclick: () => { f.half = v; f.selected = null; render(); } }, label))),
     possessionSummary(game, f.half),
     h("h2", {}, "Team totals"),
-    h("div", { class: "totals" }, types.map((et) => h("div", { class: et.side },
-      h("div", { class: "v", "data-total": et.id }, t.total[et.id]),
-      h("div", { class: "k" }, symbolIcon(et.id, 12), et.short)))),
-    h("h2", {}, "Where it happened"),
-    h("div", { class: "chips", role: "group", "aria-label": "Team" },
-      [["Us", "us"], ["Opposition", "them"], ["Both", "all"]].map(([label, v]) =>
-        h("button", { type: "button", class: "chip", "data-team": v, "aria-pressed": String(f.team === v), onclick: () => { f.team = v; if (v === "them") f.playerId = undefined; render(); } }, label))),
-    h("div", { class: "chips", role: "group", "aria-label": "Show events" },
-      types.map((et) => h("button", {
-        type: "button", class: "chip", "aria-pressed": String(f.types.has(et.id)),
-        onclick: () => { f.types.has(et.id) ? f.types.delete(et.id) : f.types.add(et.id); render(); },
-      }, symbolIcon(et.id, 14), et.label))),
-    f.playerId !== undefined && h("p", { class: "small" }, `Showing ${S.gamePlayerLabel(st, game, f.playerId)} only. `,
-      h("button", { type: "button", class: "link-btn", onclick: () => { f.playerId = undefined; render(); } }, "Show everyone")),
-    pitchSvg({ marks: shown, label: `Pitch map of ${plural(shown.length, "event")}. Your team attacks to the right.` }),
-    h("p", { class: "muted small", style: "margin-top:6px" }, "Attacking →. Filled = won / on target, hollow = lost / off target."),
-    h("h2", {}, "By player"),
-    t.byPlayer.size || game.starting.length
-      ? [h("p", { class: "muted small" }, "Tap a player to show only their events on the map. Mins = minutes on the pitch."), statsTable(t, { selectable: true, game, st, minutes: S.playingTime(game) })]
-      : h("p", { class: "muted" }, "No events yet."),
+    totalsTiles(types, t.total, f.type, (id) => pick(undefined, id)),
+    h("div", { class: "drill", id: "stats-map" },
+      h("div", { class: "map-sticky" },
+        h("div", { class: "drill-head" },
+          h("span", { id: "drill-summary" }, h("strong", {}, what), ` · ${who} · `, plural(picked.length, "event")),
+          (f.type !== "all" || f.playerId !== undefined) && h("button", { type: "button", class: "link-btn", id: "show-all", onclick: () => { Object.assign(f, { type: "all", playerId: undefined, selected: null }); render(); } }, "Show all")),
+        pitchSvg({ marks: shown, selected, onMark: select, label: `Pitch map of ${plural(shown.length, "event")}. Your team attacks to the right.` })),
+      h("div", { class: "chips", role: "group", "aria-label": "Team" },
+        [["Us", "us"], ["Opposition", "them"], ["Both", "all"]].map(([label, v]) =>
+          h("button", { type: "button", class: "chip", "data-team": v, "aria-pressed": String(f.team === v), onclick: () => { f.team = v; if (v === "them") f.playerId = undefined; f.selected = null; render(); } }, label)),
+        h("span", { class: "chip-gap" }),
+        [["All", "all"], ["Attack", "attack"], ["Defend", "defend"]].map(([label, v]) =>
+          h("button", { type: "button", class: "chip", "data-side": v, "aria-pressed": String(f.type === v), onclick: () => { f.type = v; f.selected = null; render(); } }, label))),
+      h("h2", {}, "By player"),
+      t.byPlayer.size || game.starting.length
+        ? [h("p", { class: "muted small" }, "Tap a player, a column or a number to see just those on the map. Mins = minutes on the pitch."),
+            statsTable(t, { game, st, minutes: S.playingTime(game), pick, sel: { playerId: f.playerId, type: f.type } })]
+        : h("p", { class: "muted" }, "No events yet."),
+      h("h2", {}, `Timeline (${picked.length})`),
+      picked.length
+        ? h("ul", { class: "list timeline", id: "timeline" }, picked.map((e) => eventRow(game, e, { st, readOnly, selected: e.id === selected, onSelect: select })))
+        : h("p", { class: "muted" }, "Nothing to show for this selection.")),
     game.subs.length > 0 && h("details", { style: "margin-top:20px" },
       h("summary", { style: "font-weight:700;cursor:pointer;font-size:1.15rem" }, `Substitutions (${game.subs.length})`),
       h("ul", { class: "list", style: "margin-top:8px", id: "subs-list" }, [...game.subs].sort((a, b) => a.half - b.half || a.t - b.t).map((x) => h("li", {},
@@ -1597,15 +1638,21 @@ function viewStats(game, { st = app.state, readOnly = false, sharedBy = null, co
           h("div", { class: "primary" }, "Substitution"),
           h("div", { class: "secondary" }, [x.on.length && `On: ${x.on.map((id) => S.gamePlayerLabel(st, game, id)).join(", ")}`, x.off.length && `Off: ${x.off.map((id) => S.gamePlayerLabel(st, game, id)).join(", ")}`].filter(Boolean).join(" · "))),
         !readOnly && h("button", { type: "button", class: "link-btn", onclick: () => commit(() => S.deleteSub(game, x.id)) }, "Delete"))))),
-    game.events.length > 0 && h("details", { style: "margin-top:20px" },
-      h("summary", { style: "font-weight:700;cursor:pointer;font-size:1.15rem" }, `All events (${game.events.length})`),
-      h("ul", { class: "list", style: "margin-top:8px" }, [...game.events].sort((a, b) => b.half - a.half || b.t - a.t).map((e) => eventRow(game, e, { st, readOnly })))),
     h("h2", {}, "Game"),
     h("div", { class: "row", style: "flex-wrap:wrap" },
       h("button", { type: "button", class: "btn btn-quiet", onclick: () => download(`${game.date}-vs-${game.opponent.replace(/[^\w-]+/g, "-")}.csv`, S.gameCSV(st, game), "text/csv") }, "Download CSV"),
       owner && h("button", { type: "button", class: "btn btn-quiet", onclick: () => editGame(game) }, "Edit details"),
       owner && h("button", { type: "button", class: "btn btn-danger", id: "reset-game", onclick: () => confirmReset(game) }, "Reset game"),
       owner && h("button", { type: "button", class: "btn btn-danger", id: "delete-game", onclick: () => confirmDelete(game) }, "Delete game")));
+}
+
+/** Count per event type, as buttons: tap one to show only that type (again for all). */
+function totalsTiles(types, total, current, onPick) {
+  return h("div", { class: "totals" }, types.map((et) => h("button", {
+    type: "button", class: et.side, "aria-pressed": String(current === et.id), "data-type": et.id, onclick: () => onPick(et.id),
+  },
+    h("div", { class: "v", "data-total": et.id }, total[et.id]),
+    h("div", { class: "k" }, symbolIcon(et.id, 12), et.short))));
 }
 
 /** Reset: back to before kick-off, keeping the game's details and team sheet. Undoable. */
@@ -1692,33 +1739,204 @@ function editorsPicker(game) {
       "Also editing all your games (set by an admin): ", teamEditors.map((c) => c.name || c.email).join(", "), "."));
 }
 
-/** With a game, players are labelled and sorted by the number they wore in it. */
-function statsTable(t, { selectable, game, minutes = new Map(), st = app.state, events = game ? game.events : st.games.flatMap((g) => g.events) }) {
+/**
+ * Players × event types. With a game, players are labelled and sorted by the number they wore in it.
+ *   pick(playerId, type): game stats – tap a name, a column heading or a number to filter.
+ *   sort + onSort(col):  season – tap a heading to rank players by it; rowHref(id) opens a player.
+ */
+function statsTable(t, { game, minutes = new Map(), st = app.state, events = game ? game.events : st.games.flatMap((g) => g.events), pick = null, sel = {}, sort = null, onSort = null, rowHref = null, games = null }) {
   const labelFor = (k) => (game ? S.gamePlayerLabel(st, game, k) : S.playerLabel(st, k));
   const numberFor = (k) => game?.roster.find((r) => r.playerId === k)?.number ?? st.players.find((p) => p.id === k)?.number ?? 0;
-  const f = app.statsFilter;
+  const zero = Object.fromEntries(S.EVENT_IDS.map((id) => [id, 0]));
+  const types = S.statTypes(events);
+  const ids = types.map((t) => t.id);
+  const sum = (counts) => ids.reduce((n, id) => n + counts[id], 0);
+  const countsOf = (k) => t.byPlayer.get(k) ?? zero;
+  const valueOf = (k, col) => (col === "mins" ? minutes.get(k) ?? 0 : col === "games" ? games?.get(k) ?? 0 : col === "all" ? sum(countsOf(k)) : countsOf(k)[col] ?? 0);
   // Everyone who played or did something, even if one without the other.
   const keys = [...new Set([...t.byPlayer.keys(), ...[...minutes].filter(([, s]) => s > 0).map(([id]) => id)])].sort((a, b) => {
     if (a === "unknown") return 1;
     if (b === "unknown") return -1;
-    return numberFor(a) - numberFor(b);
+    if (sort && sort.col !== "player") return (valueOf(b, sort.col) - valueOf(a, sort.col)) * sort.dir || numberFor(a) - numberFor(b);
+    return (numberFor(a) - numberFor(b)) * (sort?.col === "player" ? sort.dir : 1);
   });
-  const types = S.statTypes(events);
-  const ids = types.map((t) => t.id);
-  const sum = (counts) => ids.reduce((n, id) => n + counts[id], 0);
-  return h("div", { class: "table-wrap" }, h("table", {},
-    h("thead", {}, h("tr", {}, h("th", {}, "Player"), h("th", { class: "num" }, "Mins"), types.map((et) => h("th", { class: "num", title: et.label }, et.short)), h("th", { class: "num" }, "All"))),
+  const typeSelected = (id) => sel.type === id;
+  const th = (col, label, { title, num = true } = {}) => {
+    const sorted = sort?.col === col;
+    const onclick = onSort ? () => onSort(col) : pick && (ids.includes(col) || col === "all") ? () => pick(undefined, col) : null;
+    return h("th", {
+      class: [num && "num", onclick && "clickable", (sorted || typeSelected(col)) && "active"].filter(Boolean).join(" ") || null,
+      title, "data-col": col, onclick,
+      "aria-sort": sorted ? (sort.dir > 0 ? "descending" : "ascending") : null,
+    }, label, sorted ? (sort.dir > 0 ? " ▾" : " ▴") : "");
+  };
+  const cell = (k, id, text) => {
+    const cls = [pick && "clickable", typeSelected(id) && "col-sel", typeSelected(id) && sel.playerId === k && "cell-sel"].filter(Boolean).join(" ");
+    return h("td", { class: `num ${cls}`.trim(), "data-type": id, onclick: pick ? (e) => { e.stopPropagation(); pick(k, id); } : null }, text);
+  };
+  return h("div", { class: "table-wrap" }, h("table", { class: pick || onSort ? "interactive" : null },
+    h("thead", {}, h("tr", {},
+      th("player", "Player", { num: false }),
+      games && th("games", "Gms", { title: "Games played" }),
+      th("mins", "Mins", { title: "Minutes on the pitch" }),
+      types.map((et) => th(et.id, et.short, { title: et.label })),
+      th("all", "All", { title: "All events" }))),
     h("tbody", {}, keys.map((k) => {
-      const counts = t.byPlayer.get(k) ?? Object.fromEntries(S.EVENT_IDS.map((id) => [id, 0]));
+      const counts = countsOf(k);
+      const href = rowHref && k !== "unknown" ? rowHref(k) : null;
       return h("tr", {
-        class: selectable ? "clickable" : null,
-        "aria-selected": selectable ? String(f.playerId === k) : null,
-        onclick: selectable ? () => { f.playerId = f.playerId === k ? undefined : k; render(); } : null,
-      }, h("td", {}, labelFor(k)), h("td", { class: "num" }, k === "unknown" ? "" : S.formatMinutes(minutes.get(k))), ids.map((id) => h("td", { class: "num" }, counts[id] || "·")), h("td", { class: "num" }, sum(counts)));
+        class: pick || href ? "clickable" : null,
+        "aria-selected": pick ? String(sel.playerId === k) : null,
+        onclick: pick ? () => pick(k, undefined) : href ? () => go(href) : null,
+      },
+        h("td", {}, href ? h("a", { href, onclick: (e) => e.stopPropagation() }, labelFor(k)) : labelFor(k)),
+        games && h("td", { class: "num" }, k === "unknown" ? "" : games.get(k) ?? 0),
+        h("td", { class: "num" }, k === "unknown" ? "" : S.formatMinutes(minutes.get(k))),
+        ids.map((id) => cell(k, id, counts[id] || "·")),
+        h("td", { class: "num" }, sum(counts)));
     })),
     h("tfoot", {},
-      h("tr", {}, h("td", {}, "Team"), h("td", {}), ids.map((id) => h("td", { class: "num" }, t.total[id])), h("td", { class: "num" }, sum(t.total))),
+      h("tr", {}, h("td", {}, "Team"), games && h("td", {}), h("td", {}), ids.map((id) => h("td", { class: `num${typeSelected(id) ? " col-sel" : ""}` }, t.total[id])), h("td", { class: "num" }, sum(t.total))),
       game && sum(t.them) > 0 && h("tr", { class: "them-row" }, h("td", {}, "Opposition"), h("td", {}), ids.map((id) => h("td", { class: "num" }, t.them[id] || "·")), h("td", { class: "num" }, sum(t.them))))));
+}
+
+// ---- Season: player stats across every game
+
+/** Your own team's season. */
+function ownSeason() {
+  return {
+    st: app.state, title: app.state.teamName || "Your team", base: "#/season", back: "#/games", backLabel: "‹ Games",
+    playerHref: (id) => `#/season/${id}`,
+    games: app.state.games.map((g) => ({ game: g, href: `#/game/${g.id}/stats` })),
+  };
+}
+
+/** A shared team's season (or, for a player, their team's). */
+function teamSeason(uid) {
+  const team = app.sharedTeams.find((t) => t.uid === uid) ?? (app.role === "player" && uid === app.playerTeam ? { uid, players: [] } : null);
+  if (!team) return null;
+  const shared = app.shared.filter((x) => x.owner === uid);
+  let st;
+  try {
+    st = S.parseState({ players: team.players ?? [], games: shared.map((x) => x.game) });
+  } catch {
+    st = S.parseState({ players: team.players ?? [], games: [] });
+  }
+  const base = `#/team/${encodeURIComponent(uid)}`;
+  return {
+    st, title: team.teamName || `${team.ownerName || "A coach"}'s team`, base: `${base}/season`,
+    back: app.role === "player" ? "#/games" : base, backLabel: "‹ Team",
+    playerHref: (id) => `${base}/player/${id}`,
+    games: st.games.map((g) => ({ game: g, href: `#/shared/${encodeURIComponent(shared.find((x) => x.game.id === g.id)?.docId ?? "")}` })),
+  };
+}
+
+function viewTeamSeason(r) {
+  const ctx = teamSeason(r.uid);
+  if (!ctx) {
+    return h("section", {}, h("a", { class: "link-btn", href: "#/games" }, "‹ Games"),
+      h("h1", {}, "Not available"), h("p", { class: "muted" }, "This team is no longer shared with you."));
+  }
+  return r.sub === "player" ? viewSeasonPlayer(ctx, r.playerId) : viewSeason(ctx);
+}
+
+function viewSeason(ctx) {
+  const { st } = ctx;
+  const sf = app.season;
+  if (sf.key !== ctx.base) Object.assign(sf, { key: ctx.base, sort: { col: "all", dir: 1 } });
+  const t = S.seasonTally(st);
+  const minutes = S.seasonPlayingTime(st);
+  const apps = S.seasonAppearances(st);
+  const events = st.games.flatMap((g) => g.events);
+  const sortBy = (col) => {
+    sf.sort = sf.sort.col === col ? { col, dir: -sf.sort.dir } : { col, dir: col === "player" ? 1 : 1 };
+    render();
+  };
+  // The top three for each stat anyone has.
+  const leaders = S.statTypes(events).filter((et) => t.total[et.id] > 0).map((et) => {
+    const top = [...t.byPlayer].filter(([k, c]) => k !== "unknown" && c[et.id] > 0).sort((a, b) => b[1][et.id] - a[1][et.id]).slice(0, 3);
+    return { et, top };
+  }).filter((x) => x.top.length);
+  return h("section", { id: "season" },
+    h("a", { class: "link-btn", href: ctx.back }, ctx.backLabel),
+    h("h1", { style: "margin-bottom:4px" }, "Player stats"),
+    h("p", { class: "muted" }, `${ctx.title} · ${plural(st.games.length, "game")}`),
+    !t.byPlayer.size && !minutes.size && h("p", { class: "muted" }, "No stats yet. They build up as you log games."),
+    leaders.length > 0 && [
+      h("h2", {}, "Leaders"),
+      h("p", { class: "muted small" }, "Tap a stat to rank everyone by it."),
+      h("ul", { class: "list leaders", id: "leaders" }, leaders.map(({ et, top }) => h("li", {
+        class: "clickable", "data-type": et.id,
+        onclick: () => { sf.sort = { col: et.id, dir: 1 }; render(); document.getElementById("season-table")?.scrollIntoView({ behavior: "smooth", block: "start" }); },
+      },
+        symbolIcon(et.id, 18),
+        h("div", { class: "main" },
+          h("div", { class: "primary" }, et.label, h("span", { class: "muted small" }, ` · ${t.total[et.id]} in total`)),
+          h("div", { class: "secondary" }, top.map(([k, c]) => `${S.playerLabel(st, k)} ${c[et.id]}`).join(" · ")))))),
+    ],
+    (t.byPlayer.size > 0 || minutes.size > 0) && [
+      h("h2", { id: "season-table" }, "All players"),
+      h("p", { class: "muted small" }, "Tap a column to sort by it. Tap a player for their games and pitch map."),
+      statsTable(t, { st, minutes, games: apps, sort: sf.sort, onSort: sortBy, rowHref: ctx.playerHref }),
+    ]);
+}
+
+function viewSeasonPlayer(ctx, id) {
+  const { st } = ctx;
+  const sf = app.season;
+  const key = `${ctx.base}/${id}`;
+  if (sf.pkey !== key) Object.assign(sf, { pkey: key, type: "all", selected: null });
+  const label = S.playerLabel(st, id);
+  const games = [...ctx.games].sort((a, b) => (a.game.date < b.game.date ? -1 : a.game.date > b.game.date ? 1 : a.game.id - b.game.id));
+  const mins = new Map(games.map(({ game }) => [game.id, S.playingTime(game).get(id) ?? 0]));
+  const mine = games.flatMap(({ game }) => game.events.filter((e) => e.team !== "them" && e.playerId === id).map((e) => ({ e, game })));
+  const played = games.filter(({ game }) => mins.get(game.id) > 0 || mine.some((x) => x.game === game));
+  const total = S.tally(mine.map((x) => x.e)).total;
+  const types = S.statTypes(mine.map((x) => x.e)).filter((et) => total[et.id] > 0);
+  const picked = mine.filter((x) => S.typeMatches(sf.type, x.e.type));
+  const selected = picked.some((x) => x.e.id === sf.selected) ? sf.selected : null;
+  const shown = picked.map((x) => x.e).filter((e) => e.x != null);
+  const select = (e) => { sf.selected = sf.selected === e.id ? null : e.id; render(); };
+  const setType = (v) => { sf.type = sf.type === v && v !== "all" ? "all" : v; sf.selected = null; render(); };
+  const openGame = (game, href) => {
+    // Open that game's stats focused on this player.
+    Object.assign(app.statsFilter, { gameId: game.id, half: 0, type: "all", playerId: id, team: "us", selected: null });
+    go(href);
+  };
+  const what = sf.type === "all" ? "All events" : sf.type === "attack" ? "Attack events" : sf.type === "defend" ? "Defend events" : S.eventType(sf.type).label;
+  const totalMins = [...mins.values()].reduce((a, b) => a + b, 0);
+  return h("section", { id: "season-player" },
+    h("a", { class: "link-btn", href: ctx.base }, "‹ Player stats"),
+    h("h1", { style: "margin-bottom:4px" }, label),
+    h("p", { class: "muted" }, `${ctx.title} · ${plural(played.length, "game")}${totalMins ? ` · ${S.formatMinutes(totalMins)} mins` : ""}`),
+    !mine.length && h("p", { class: "muted" }, "No events logged for them yet."),
+    types.length > 0 && [h("h2", {}, "Totals"), totalsTiles(types, total, sf.type, setType)],
+    mine.length > 0 && h("div", { class: "drill", id: "stats-map" },
+      h("div", { class: "map-sticky" },
+        h("div", { class: "drill-head" },
+          h("span", { id: "drill-summary" }, h("strong", {}, what), " · ", plural(picked.length, "event")),
+          sf.type !== "all" && h("button", { type: "button", class: "link-btn", id: "show-all", onclick: () => setType("all") }, "Show all")),
+        pitchSvg({ marks: shown, selected, onMark: select, label: `Pitch map of ${plural(shown.length, "event")} by ${label}. Attacking to the right.` })),
+      h("div", { class: "chips", role: "group", "aria-label": "Events" },
+        [["All", "all"], ["Attack", "attack"], ["Defend", "defend"]].map(([text, v]) =>
+          h("button", { type: "button", class: "chip", "data-side": v, "aria-pressed": String(sf.type === v), onclick: () => setType(v) }, text))),
+      h("h2", {}, "Game by game"),
+      h("p", { class: "muted small" }, "Tap a game to open its stats, showing this player."),
+      h("div", { class: "table-wrap" }, h("table", { class: "interactive", id: "player-games" },
+        h("thead", {}, h("tr", {}, h("th", {}, "Game"), h("th", { class: "num" }, "Mins"), types.map((et) => h("th", { class: `num${sf.type === et.id ? " active" : ""}`, title: et.label }, et.short)))),
+        h("tbody", {}, [...played].reverse().map(({ game, href }) => {
+          const c = S.tally(mine.filter((x) => x.game === game).map((x) => x.e)).total;
+          return h("tr", { class: "clickable", onclick: () => openGame(game, href) },
+            h("td", {}, h("div", {}, `vs ${game.opponent}`), h("div", { class: "muted small" }, fmtDate(game.date))),
+            h("td", { class: "num" }, S.formatMinutes(mins.get(game.id))),
+            types.map((et) => h("td", { class: `num${sf.type === et.id ? " col-sel" : ""}` }, c[et.id] || "·")));
+        })))),
+      h("h2", {}, `Timeline (${picked.length})`),
+      picked.length
+        ? h("ul", { class: "list timeline", id: "timeline" }, [...picked].reverse().map(({ e, game }) => eventRow(game, e, {
+            st, readOnly: true, selected: e.id === selected, onSelect: select, detail: `vs ${game.opponent} · ${fmtDate(game.date)}`,
+          })))
+        : h("p", { class: "muted" }, "Nothing to show for this selection.")));
 }
 
 function editGame(game) {
