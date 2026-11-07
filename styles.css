@@ -148,7 +148,7 @@ body.live main { padding-top: 6px; }
 }
 .live-status .msg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .live-status .undo { appearance: none; border: 0; background: none; color: var(--selected); font: inherit; font-weight: 800; text-decoration: underline; padding: 8px 10px; cursor: pointer; flex: none; }
-.pitch { display: block; width: 100%; height: auto; max-height: 22vh; margin: 0 auto; border-radius: 10px; touch-action: manipulation; cursor: crosshair; }
+.pitch { display: block; width: min(100%, calc(22vh * 107 / 70)); height: auto; aspect-ratio: 107 / 70; max-height: 22vh; margin: 0 auto; border-radius: 10px; touch-action: manipulation; cursor: crosshair; }
 .pitch .grass { fill: var(--grass); }
 .pitch .stripe { fill: var(--grass-2); }
 .pitch .line { fill: none; stroke: var(--pitch-line); stroke-width: 0.5; }

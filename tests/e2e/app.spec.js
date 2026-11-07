@@ -93,6 +93,27 @@ test("squad: type players quickly, paste a list, upload a CSV, edit and remove",
   await expect(page.locator("#squad-list li")).toHaveText([/3\s*Morgan/, /9\s*Jordan/, /10\s*Lee/, /12\s*Dan/]);
 });
 
+test("live: a tap inside either penalty box lands inside it on a phone", async ({ page }) => {
+  await addSquad(page);
+  await newGame(page);
+  const pitch = page.locator("#pitch");
+  // The tap area is the drawn pitch itself: no empty margins either side.
+  const ratio = await pitch.evaluate((el) => { const r = el.getBoundingClientRect(); return r.width / r.height; });
+  expect(Math.abs(ratio - 107 / 70)).toBeLessThan(0.03);
+  // Tap the screen point where the drawing shows a spot; the dot lands there.
+  for (const [ux, uy] of [[8, 34], [3, 20], [97, 48], [102, 30]]) {
+    const pt = await pitch.evaluate((el, [x, y]) => {
+      const p = new DOMPoint(x, y).matrixTransform(el.getScreenCTM());
+      const r = el.getBoundingClientRect();
+      return { x: p.x - r.left, y: p.y - r.top };
+    }, [ux, uy]);
+    await pitch.click({ position: pt });
+    const dot = page.locator("#pitch .pending");
+    expect(Number(await dot.getAttribute("cx"))).toBeCloseTo(ux, 0);
+    expect(Number(await dot.getAttribute("cy"))).toBeCloseTo(uy, 0);
+  }
+});
+
 test("live: three taps in any order record an event, with undo", async ({ page }) => {
   await addSquad(page);
   await newGame(page);

@@ -1543,10 +1543,18 @@ function pitchSvg({ marks, pending, onTap, label, highlight, selected = null, on
     ]);
   if (onTap) {
     svg.addEventListener("click", (e) => {
-      const r = svg.getBoundingClientRect();
-      // Map from the padded viewBox back to pitch fractions.
-      const vx = ((e.clientX - r.left) / r.width) * (W + 2) - 1;
-      const vy = ((e.clientY - r.top) / r.height) * (H + 2) - 1;
+      // Map the tap into pitch units through the SVG's own transform, so it
+      // stays exact however the drawing is scaled or centred in its box.
+      const m = svg.getScreenCTM();
+      let vx, vy;
+      if (m) {
+        const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(m.inverse());
+        vx = p.x; vy = p.y;
+      } else {
+        const r = svg.getBoundingClientRect();
+        vx = ((e.clientX - r.left) / r.width) * (W + 2) - 1;
+        vy = ((e.clientY - r.top) / r.height) * (H + 2) - 1;
+      }
       onTap(Math.min(1, Math.max(0, vx / W)), Math.min(1, Math.max(0, vy / H)));
     });
   }
