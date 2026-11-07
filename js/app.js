@@ -623,7 +623,8 @@ function viewHelp() {
       ["The big button runs the match: ", b("Start game → Half time → Start 2nd half → Full time"), ". Each step can be undone."],
       ["The clock keeps correct time even if the phone locks."],
       [b("Subs"), ": tap who's coming off and who's going on, then ", b("Done"), ". Minutes played are counted for you."],
-      [b("Players"), ": change today's numbers or add someone who turned up."])),
+      [b("Players"), ": change today's numbers or add someone who turned up."],
+      ["Started by accident or testing? ", b("Reset game"), " clears the clock and events but keeps the team sheet. ", b("Delete game"), " removes it. Both are in the ", b("⋯"), " menu on the Games screen, and can be undone straight after."])),
     section("5. See the stats", false, ul(
       ["Tap ", b("stats →"), " on a game: score, totals, a pitch map, and a table by player with minutes."],
       ["Filter the map by half, team, or event type. Tap a player in the table to see only theirs."],
@@ -784,7 +785,7 @@ function viewGames() {
               h("div", { class: "secondary" }, `${fmtDate(g.date)} · ${plural(g.events.length, "event")}`)),
             g.shared && h("span", { class: "badge", title: "Shared with coaches (view only)" }, "Shared"),
             h("span", { class: `badge${c.running ? " live" : ""}` }, status),
-            h("a", { class: "link-btn", href: `#/game/${g.id}/stats` }, "Stats"));
+            h("button", { type: "button", class: "link-btn more", "aria-label": `More for vs ${g.opponent}`, onclick: () => gameMenu(g) }, "⋯"));
         }))
       : h("p", { class: "muted", style: "margin-top:16px" }, "No games yet."),
     app.coGames.length > 0 && [
@@ -1239,10 +1240,53 @@ function viewStats(game, { st = app.state, readOnly = false, sharedBy = null, co
     h("div", { class: "row", style: "flex-wrap:wrap" },
       h("button", { type: "button", class: "btn btn-quiet", onclick: () => download(`${game.date}-vs-${game.opponent.replace(/[^\w-]+/g, "-")}.csv`, S.gameCSV(st, game), "text/csv") }, "Download CSV"),
       owner && h("button", { type: "button", class: "btn btn-quiet", onclick: () => editGame(game) }, "Edit details"),
-      owner && h("button", { type: "button", class: "btn btn-danger", onclick: () => openDialog({
-        title: `Delete game vs ${game.opponent}?`, body: h("p", {}, `This deletes its ${plural(game.events.length, "event")}. It can't be undone unless you have an export.`),
-        okLabel: "Delete", danger: true, onOk: () => { commit(() => S.deleteGame(st, game.id), { rerender: false }); go("#/games"); },
-      }) }, "Delete game")));
+      owner && h("button", { type: "button", class: "btn btn-danger", id: "reset-game", onclick: () => confirmReset(game) }, "Reset game"),
+      owner && h("button", { type: "button", class: "btn btn-danger", id: "delete-game", onclick: () => confirmDelete(game) }, "Delete game")));
+}
+
+/** Reset: back to before kick-off, keeping the game's details and team sheet. Undoable. */
+function confirmReset(game) {
+  openDialog({
+    title: `Reset game vs ${game.opponent}?`,
+    body: [
+      h("p", {}, `Clears the clock, ${plural(game.events.length, "event")}, subs and starting lineup, as if it never kicked off.`),
+      h("p", { class: "muted small" }, "Keeps the opponent, date, half length and team sheet."),
+    ],
+    okLabel: "Reset", danger: true,
+    onOk: () => {
+      const cleared = commit(() => S.resetGame(current(game)));
+      toast("Game reset.", () => commit(() => Object.assign(current(game), cleared)));
+    },
+  });
+}
+
+/** Delete: removes the game everywhere (your account, and anyone it's shared with). Undoable straight away. */
+function confirmDelete(game) {
+  openDialog({
+    title: `Delete game vs ${game.opponent}?`,
+    body: h("p", {}, `This deletes the game and its ${plural(game.events.length, "event")}, for you and anyone it's shared with.`),
+    okLabel: "Delete", danger: true,
+    onOk: () => {
+      const copy = clone(current(game));
+      commit((st) => S.deleteGame(st, game.id), { rerender: false });
+      go("#/games");
+      toast(`Deleted game vs ${copy.opponent}.`, () => commit((st) => { if (!st.games.some((g) => g.id === copy.id)) st.games.push(copy); }));
+    },
+  });
+}
+
+/** The ⋯ menu on one of your games in the Games list. */
+function gameMenu(game) {
+  openDialog({
+    title: `vs ${game.opponent}`,
+    body: h("div", { class: "menu" },
+      h("p", { class: "muted small", style: "margin:0 0 8px" }, fmtDate(game.date)),
+      h("button", { type: "button", class: "btn btn-quiet btn-block", onclick: () => { dialog.close(); go(`#/game/${game.id}/stats`); } }, "Stats"),
+      h("button", { type: "button", class: "btn btn-quiet btn-block", onclick: () => { dialog.close(); editGame(game); } }, "Edit details"),
+      h("button", { type: "button", class: "btn btn-danger btn-block", id: "menu-reset", onclick: () => { dialog.close(); confirmReset(game); } }, "Reset game"),
+      h("button", { type: "button", class: "btn btn-danger btn-block", id: "menu-delete", onclick: () => { dialog.close(); confirmDelete(game); } }, "Delete game")),
+    okLabel: "Close", cancel: false, onOk: () => {},
+  });
 }
 
 /** The creator picks which coaches can edit this game alongside them. */

@@ -282,3 +282,5 @@ code { font-family: ui-monospace, monospace; font-size: 0.9em; background: var(-
 .help ul, .help ol { margin: 0 0 14px; padding-left: 20px; }
 .help li { margin: 4px 0; }
 .help .tip { color: var(--text-2); font-size: 0.9rem; }
+.link-btn.more { font-size: 1.4rem; line-height: 1; padding: 6px 12px; font-weight: 800; }
+.menu { display: grid; gap: 8px; }

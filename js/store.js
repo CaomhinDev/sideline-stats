@@ -229,6 +229,20 @@ export function deleteGame(state, id) {
   state.games = state.games.filter((g) => g.id !== id);
 }
 
+/**
+ * Back to before kick-off: clears the clock, events, subs and starting lineup.
+ * Keeps the opponent, date, half length, team sheet, sharing and editors.
+ * Returns what was cleared, for undo.
+ */
+export function resetGame(game) {
+  const cleared = { periods: game.periods, events: game.events, subs: game.subs, starting: game.starting };
+  game.periods = [];
+  game.events = [];
+  game.subs = [];
+  game.starting = [];
+  return cleared;
+}
+
 /** "pre" | "first" | "half" | "second" | "full" */
 export function phase(game) {
   const [p1, p2] = game.periods;

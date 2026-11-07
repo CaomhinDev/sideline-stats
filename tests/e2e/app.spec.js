@@ -722,3 +722,53 @@ test("the Help tab explains the essentials", async ({ page }) => {
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
   expect(overflow).toBeLessThanOrEqual(0);
 });
+
+test("reset and delete a game from the Games screen, with undo", async ({ page }) => {
+  await addSquad(page);
+  await newGame(page, "Reset FC");
+  await kickOff(page);
+  await ev(page, "goal").click();
+  await pl(page, 9).click();
+  await tapPitch(page, 0.95, 0.5);
+  await expect(page.locator("#score")).toHaveText("1–0");
+
+  await page.goto("./#/games");
+  const row = page.locator(".list li", { hasText: "vs Reset FC" });
+  await row.getByRole("button", { name: /More for/ }).click();
+  await page.locator("#menu-reset").click();
+  await expect(page.locator("#dialog")).toContainText("Keeps the opponent, date, half length and team sheet");
+  await page.locator("#dialog-ok").click();
+  await expect(row).toContainText("Not started");
+  await expect(row).toContainText("0 events");
+  // Undo brings it all back.
+  await page.locator("#toast button").click();
+  await expect(row).toContainText("1 event");
+
+  await row.getByRole("button", { name: /More for/ }).click();
+  await page.locator("#menu-delete").click();
+  await page.locator("#dialog-ok").click();
+  await expect(row).toHaveCount(0);
+  await page.locator("#toast button").click();
+  await expect(row).toHaveCount(1);
+
+  // Delete for real: it stays gone after a reload (and from the account).
+  await row.getByRole("button", { name: /More for/ }).click();
+  await page.locator("#menu-delete").click();
+  await page.locator("#dialog-ok").click();
+  await expect(row).toHaveCount(0);
+  await page.reload();
+  await expect(page.locator("body")).toHaveAttribute("data-sync", "ready");
+  await expect(page.locator(".list li", { hasText: "vs Reset FC" })).toHaveCount(0);
+});
+
+test("reset from a game's stats page", async ({ page }) => {
+  await addSquad(page);
+  await newGame(page, "Stats Reset");
+  await ev(page, "tackle_won").click();
+  await pl(page, 4).click();
+  await tapPitch(page, 0.4, 0.5);
+  await page.locator("#to-stats").click();
+  await page.locator("#reset-game").click();
+  await page.locator("#dialog-ok").click();
+  await expect(page.locator('[data-total="tackle_won"]')).toHaveText("0");
+});

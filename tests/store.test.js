@@ -368,3 +368,22 @@ test("game editors are kept, lowercased and de-duplicated", () => {
   delete g.editors;
   assert.equal("editors" in S.parseState(JSON.stringify(S.toExport(st))).games[0], false);
 });
+
+test("reset clears the match but keeps the game's details and team sheet", () => {
+  const st = S.emptyState();
+  const a = S.addPlayer(st, "9", "A").player;
+  const g = S.createGame(st, { opponent: "R", halfLength: 25 }).game;
+  g.shared = true;
+  g.editors = ["c@example.com"];
+  S.setOnPitch(st, g, [a.id], 0);
+  S.advancePhase(g, 0);
+  S.addEvent(st, g, { type: "goal", playerId: a.id, x: 1, y: 0.5 }, 60_000);
+  S.setOnPitch(st, g, [], 120_000);
+  const cleared = S.resetGame(g);
+  assert.equal(S.phase(g), "pre");
+  assert.deepEqual([g.events, g.subs, g.starting, g.periods], [[], [], [], []]);
+  assert.deepEqual([g.opponent, g.halfLength, g.roster.length, g.shared, g.editors], ["R", 25, 1, true, ["c@example.com"]]);
+  Object.assign(g, cleared); // undo
+  assert.equal(S.phase(g), "first");
+  assert.deepEqual(S.score(g), { us: 1, them: 0 });
+});
