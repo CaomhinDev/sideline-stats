@@ -574,6 +574,10 @@ export function parseState(text) {
       halfLength: g.halfLength,
       roster: checked.roster,
       ...(g.shared === true ? { shared: true } : {}),
+      // Coaches (lowercase emails) who may edit this game alongside its creator.
+      ...(Array.isArray(g.editors) && g.editors.length
+        ? { editors: [...new Set(g.editors.filter((e) => typeof e === "string" && e.includes("@")).map((e) => e.toLowerCase()))] }
+        : {}),
       starting: known(g.starting, "starting lineup"),
       subs,
       periods,
@@ -581,6 +585,6 @@ export function parseState(text) {
     });
   }
   state.nextId = Math.max(Number.isInteger(data.nextId) ? data.nextId : 1, Math.max(0, ...ids) + 1);
-  if (data.shareTeam === true) state.shareTeam = true; // family can view the squad and every game
+  if (data.shareTeam === true) state.shareTeam = true; // every coach can view the squad and every game
   return state;
 }

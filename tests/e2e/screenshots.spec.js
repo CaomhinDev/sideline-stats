@@ -60,6 +60,12 @@ for (const scheme of ["light", "dark"]) {
     await shot("games", true);
     await page.goto("./#/squad");
     await shot("squad");
+    await page.goto("./#/help");
+    await page.locator("#help summary", { hasText: "Share with other coaches" }).click();
+    await shot("help", true);
+    await page.goto("./#/game/50/stats");
+    await page.locator("#editors").scrollIntoViewIfNeeded();
+    await shot("editors");
     await page.goto("./#/game/50");
     await page.locator("#subs-btn").click();
     await page.locator('#sub-on .sub-chip[data-number="5"]').click();

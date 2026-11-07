@@ -24,6 +24,8 @@ const app = {
   authError: null,
   shared: [], // games others have shared: [{ docId, owner, ownerName, names, game }]
   sharedTeams: [], // teams others have shared: [{ uid, ownerName, players }]
+  coGames: [], // other coaches' games you can edit: [{ docId, owner, ownerName, st, game }]
+  coaches: [], // the allowlist: [{ email, name }]
   route: { name: "games" },
   pending: null, // live entry: { gameId, x, y, type, playerId } – playerId undefined = not chosen, null = unknown
   statsFilter: { half: 0, types: new Set(S.EVENT_IDS), playerId: undefined },
@@ -41,11 +43,23 @@ function commit(mutate, { rerender = true } = {}) {
 
 // ---------------------------------------------------------------- account & sync
 
-// What we last sent to (or received from) Firestore, as JSON, so only real changes are written.
-const sent = { players: null, games: new Map() };
+// What we last sent to (or received from) Firestore, so only real changes are written.
+//   players: JSON of your squad doc
+//   games:   docId → { game, top } for your games (game = a copy, top = owner-only fields as JSON)
+//   co:      docId → game copy, for other coaches' games you can edit
+const sent = { players: null, games: new Map(), co: new Map() };
 let stopWatching = [];
 
-/** Names (and usual numbers) of everyone in a game, so family can view it without your squad. */
+const clone = (v) => JSON.parse(JSON.stringify(v));
+
+/** JSON with object keys sorted, so two copies of the same data compare equal. */
+function stable(v) {
+  if (Array.isArray(v)) return `[${v.map(stable).join(",")}]`;
+  if (v && typeof v === "object") return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stable(v[k])}`).join(",")}}`;
+  return JSON.stringify(v);
+}
+
+/** Names (and usual numbers) of everyone in a game, so other coaches can view it without your squad. */
 function namesFor(game) {
   const ids = new Set([...game.roster.map((r) => r.playerId), ...game.events.map((e) => e.playerId).filter((id) => id != null)]);
   const out = {};
@@ -56,30 +70,57 @@ function namesFor(game) {
   return out;
 }
 
+/**
+ * The Firestore updates that turn prev into cur. Events and subs are added and
+ * removed one by one (so two coaches' simultaneous entries both survive); every
+ * other field is set whole.
+ */
+function gameOps(prev, cur) {
+  const set = {};
+  for (const key of new Set([...Object.keys(prev), ...Object.keys(cur)])) {
+    if (key === "events" || key === "subs") continue;
+    if (stable(prev[key]) !== stable(cur[key])) set[`game.${key}`] = cur[key] === undefined ? cloud.unset() : clone(cur[key]);
+  }
+  const ops = Object.keys(set).length ? [set] : [];
+  for (const key of ["events", "subs"]) {
+    const before = new Map((prev[key] ?? []).map((x) => [x.id, stable(x)]));
+    const after = new Map((cur[key] ?? []).map((x) => [x.id, stable(x)]));
+    const removed = (prev[key] ?? []).filter((x) => after.get(x.id) !== stable(x));
+    const added = (cur[key] ?? []).filter((x) => before.get(x.id) !== stable(x));
+    if (removed.length) ops.push({ [`game.${key}`]: cloud.remove(removed) });
+    if (added.length) ops.push({ [`game.${key}`]: cloud.add(added) });
+  }
+  return ops;
+}
+
 // Writes not yet confirmed by Firebase. While any are outstanding, an incoming
 // snapshot may predate them, so it's held back (and applied once they settle).
 let inFlight = 0;
 let heldBack = null;
+let heldBackCo = null;
 
 function track(promise) {
   inFlight++;
   promise.catch(syncFailed).finally(() => {
     inFlight--;
-    if (inFlight === 0 && heldBack) {
-      const args = heldBack;
-      heldBack = null;
-      receive(...args);
+    if (inFlight === 0) {
+      if (heldBack) { const args = heldBack; heldBack = null; receive(...args); }
+      if (heldBackCo) { const list = heldBackCo; heldBackCo = null; receiveEditable(list); }
     }
   });
 }
 
-function syncFailed(e) {
+async function syncFailed(e) {
   console.warn("Sync failed:", e);
-  if (e?.code === "permission-denied") {
+  // Refused writes are either a removed coach (then lock the app) or, say, a game
+  // whose editor rights were just taken away (then the watchers drop it).
+  if (e?.code === "permission-denied" && app.user && cloud && (await cloud.isAllowed(app.user)) === false) {
     app.access = "denied";
     render();
   }
 }
+
+const topFields = (g, teamShared) => ({ shared: teamShared || g.shared === true, editors: g.editors ?? [], names: namesFor(g) });
 
 /** Writes anything that changed since the last sync. Firestore queues writes while offline. */
 function pushChanges() {
@@ -98,25 +139,38 @@ function pushChanges() {
   }
   const live = new Set();
   for (const g of app.state.games) {
-    live.add(g.id);
-    // Sharing the team shares every game, so a change to that switch re-sends them all.
-    const json = JSON.stringify(g) + (teamShared ? "|team" : "");
-    if (sent.games.get(g.id) !== json) {
-      sent.games.set(g.id, json);
-      track(cloud.saveGame(app.user, g, namesFor(g), teamShared || g.shared === true));
+    const docId = cloud.gameDocId(uid, g.id);
+    live.add(docId);
+    const top = topFields(g, teamShared);
+    const topJson = stable(top);
+    const prev = sent.games.get(docId);
+    if (!prev) {
+      track(cloud.saveGame(app.user, g, top.names, top.shared));
+    } else {
+      const ops = gameOps(prev.game, g);
+      if (topJson !== prev.top) ops.unshift(top);
+      for (const fields of ops) track(cloud.updateGame(docId, fields));
+    }
+    sent.games.set(docId, { game: clone(g), top: topJson });
+  }
+  for (const docId of [...sent.games.keys()]) {
+    if (!live.has(docId)) {
+      sent.games.delete(docId);
+      track(cloud.removeGame(uid, docId.slice(uid.length + 1)));
     }
   }
-  for (const id of [...sent.games.keys()]) {
-    if (!live.has(id)) {
-      sent.games.delete(id);
-      track(cloud.removeGame(uid, id));
-    }
+  // Other coaches' games you're editing: only the game itself can change.
+  for (const entry of app.coGames) {
+    const prev = sent.co.get(entry.docId);
+    if (!prev) continue;
+    for (const fields of gameOps(prev, entry.game)) track(cloud.updateGame(entry.docId, fields));
+    sent.co.set(entry.docId, clone(entry.game));
   }
 }
 
 let reconciled = false;
 
-/** Applies your squad and games from Firestore (another device, or after reconnecting). */
+/** Applies your squad and games from Firestore (another device, another coach, or after reconnecting). */
 function receive(user, games, fromServer) {
   if (inFlight > 0 && reconciled) {
     heldBack = [user, games, fromServer];
@@ -160,16 +214,48 @@ function receive(user, games, fromServer) {
     console.warn("Ignoring unreadable cloud data:", e);
     return;
   }
+  // Remember the server's copy as the base for future field-level updates.
+  const teamShared = incoming.shareTeam === true;
+  sent.players = JSON.stringify({ players: incoming.players, teamShared });
+  sent.games = new Map(incoming.games.map((g) => [cloud.gameDocId(app.user.uid, g.id), { game: clone(g), top: stable(topFields(g, teamShared)) }]));
   // Usually this is just our own write coming back: keep the same objects (open
   // dialogs and Undo buttons hold references to them) unless something really changed.
   if (canonical(incoming) === canonical(app.state)) return;
   incoming.nextId = Math.max(incoming.nextId, app.state.nextId);
-  const teamShared = incoming.shareTeam === true;
-  sent.players = JSON.stringify({ players: incoming.players, teamShared });
-  sent.games = new Map(incoming.games.map((g) => [g.id, JSON.stringify(g) + (teamShared ? "|team" : "")]));
   app.state = incoming;
   storage.saveState(app.state);
   render();
+}
+
+/** Other coaches' games you can edit, as [{ docId, owner, ownerName, st, game }]. */
+function receiveEditable(list) {
+  if (inFlight > 0) {
+    heldBackCo = list;
+    return;
+  }
+  const next = [];
+  for (const item of list) {
+    const players = Object.entries(item.names ?? {}).map(([id, p]) => ({ id: Number(id), number: p.number, name: p.name ?? "" }));
+    let st;
+    try {
+      st = S.parseState({ players, games: [item.game] });
+    } catch (e) {
+      console.warn("Ignoring unreadable shared game:", e);
+      continue;
+    }
+    const game = st.games[0];
+    const old = app.coGames.find((x) => x.docId === item.docId);
+    sent.co.set(item.docId, clone(game));
+    if (old && stable(old.game) === stable(game) && stable(old.st.players) === stable(st.players)) {
+      next.push(old); // unchanged: keep the objects the screen is using
+    } else {
+      next.push({ docId: item.docId, owner: item.owner, ownerName: item.ownerName, st, game });
+    }
+  }
+  for (const docId of [...sent.co.keys()]) if (!next.some((x) => x.docId === docId)) sent.co.delete(docId);
+  const changed = stable(next.map((x) => x.game)) !== stable(app.coGames.map((x) => x.game));
+  app.coGames = next;
+  if (changed || ["games", "co", "costats"].includes(app.route.name)) render();
 }
 
 /** Squad and games in a fixed shape and order, for comparing two copies. */
@@ -177,7 +263,7 @@ function canonical(state) {
   try {
     const st = S.parseState({ players: state.players, games: state.games, shareTeam: state.shareTeam === true });
     st.games.sort((a, b) => a.id - b.id);
-    return JSON.stringify({ players: st.players, games: st.games, shareTeam: st.shareTeam === true });
+    return stable({ players: st.players, games: st.games, shareTeam: st.shareTeam === true });
   } catch {
     return Math.random().toString(); // unreadable: treat as different
   }
@@ -198,10 +284,14 @@ async function startAccount(user) {
   reconciled = false;
   inFlight = 0;
   heldBack = null;
+  heldBackCo = null;
   sent.players = null;
   sent.games = new Map();
+  sent.co = new Map();
   app.shared = [];
   app.sharedTeams = [];
+  app.coGames = [];
+  app.coaches = [];
   app.user = user;
   app.authError = null;
   if (!user) {
@@ -236,17 +326,24 @@ async function startAccount(user) {
     document.body.dataset.sync = "ready";
     return;
   }
+  const warn = (what) => (e) => console.warn(`${what} unavailable:`, e);
+  const rerenderOn = (...routes) => () => { if (routes.includes(app.route.name)) render(); };
+  const sharedChanged = rerenderOn("games", "shared", "team");
+  const teamsChanged = rerenderOn("games", "team");
+  const coachesChanged = rerenderOn("data", "stats");
   stopWatching.push(
     cloud.watchMine(user.uid, receive, syncFailed),
-    cloud.watchShared(user.uid, (list) => { app.shared = list; if (["games", "shared", "team"].includes(app.route.name)) render(); }, (e) => console.warn("Shared games unavailable:", e)),
-    cloud.watchSharedTeams(user.uid, (list) => { app.sharedTeams = list; if (["games", "team"].includes(app.route.name)) render(); }, (e) => console.warn("Shared teams unavailable:", e)),
+    cloud.watchShared(user.uid, (list) => { app.shared = list; sharedChanged(); }, warn("Shared games")),
+    cloud.watchSharedTeams(user.uid, (list) => { app.sharedTeams = list; teamsChanged(); }, warn("Shared teams")),
+    cloud.watchEditable(user, receiveEditable, warn("Games you can edit")),
+    cloud.watchCoaches((list) => { app.coaches = list; coachesChanged(); }, warn("Coaches list")),
   );
 }
 
 const saveMeta = () => storage.saveMeta(app.meta);
 const findGame = (id) => app.state.games.find((g) => g.id === id);
-/** The live copy of a game, for callbacks that run later (the data may have been refreshed from another device). */
-const current = (game) => findGame(game.id) ?? game;
+/** The live copy of a game (yours, or one you're editing), for callbacks that run later: the data may have been refreshed from another device. */
+const current = (game) => findGame(game.id) ?? app.coGames.find((x) => x.game.id === game.id)?.game ?? game;
 
 // ---------------------------------------------------------------- formatting
 
@@ -417,7 +514,8 @@ function parseRoute() {
   if (parts[0] === "game" && parts[1]) return { name: parts[2] === "stats" ? "stats" : "live", id: Number(parts[1]) };
   if (parts[0] === "shared" && parts[1]) return { name: "shared", docId: decodeURIComponent(parts[1]) };
   if (parts[0] === "team" && parts[1]) return { name: "team", uid: decodeURIComponent(parts[1]) };
-  if (["games", "squad", "data", "new"].includes(parts[0])) return { name: parts[0] };
+  if (parts[0] === "co" && parts[1]) return { name: parts[2] === "stats" ? "costats" : "co", docId: decodeURIComponent(parts[1]) };
+  if (["games", "squad", "data", "new", "help"].includes(parts[0])) return { name: parts[0] };
   return { name: "games" };
 }
 
@@ -447,22 +545,29 @@ function render() {
     return;
   }
   const r = app.route;
-  const game = r.id != null ? findGame(r.id) : null;
+  const coEntry = r.name === "co" || r.name === "costats" ? app.coGames.find((x) => x.docId === r.docId) ?? null : null;
+  const game = r.id != null ? findGame(r.id) : coEntry?.game ?? null;
   if ((r.name === "live" || r.name === "stats") && !game) {
     app.route = { name: "games" };
     history.replaceState(null, "", "#/games");
     return render();
   }
-  const live = r.name === "live";
+  const live = r.name === "live" || (r.name === "co" && !!coEntry);
   document.body.classList.toggle("live", live);
   document.getElementById("tabs").hidden = live;
-  const tab = ["new", "stats", "shared", "team"].includes(r.name) ? "games" : r.name;
+  const tab = ["new", "stats", "shared", "team", "co", "costats"].includes(r.name) ? "games" : r.name;
   for (const a of document.querySelectorAll(".tabs a")) {
     if (a.dataset.tab === tab) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
   }
   renderBanner(live);
-  const views = { games: viewGames, new: viewNewGame, live: () => viewLive(game), stats: () => viewStats(game), shared: viewShared, team: viewTeam, squad: viewSquad, data: viewData };
+  const notEditable = () => h("section", {}, h("a", { class: "link-btn", href: "#/games" }, "‹ Games"),
+    h("h1", {}, "Not available"), h("p", { class: "muted" }, "You can't edit this game (anymore). The coach who created it may have removed you."));
+  const views = {
+    games: viewGames, new: viewNewGame, live: () => viewLive(game), stats: () => viewStats(game), shared: viewShared, team: viewTeam, squad: viewSquad, data: viewData, help: viewHelp,
+    co: () => (coEntry ? viewLive(coEntry.game) : notEditable()),
+    costats: () => (coEntry ? viewStats(coEntry.game, { st: coEntry.st, co: coEntry }) : notEditable()),
+  };
   view.replaceChildren(views[r.name]());
   updateWakeLock(live && S.clock(game).running);
   tick();
@@ -490,6 +595,53 @@ function renderBanner(live) {
   banner.replaceChildren(...(content ?? []));
 }
 
+// ---- Help
+
+function viewHelp() {
+  const section = (title, open, ...items) => h("details", { open: open || null }, h("summary", {}, title), ...items);
+  const ul = (...lis) => h("ul", {}, lis.map((li) => h("li", {}, li)));
+  const b = (t) => h("strong", {}, t);
+  return h("section", { class: "help", id: "help" },
+    h("h1", {}, "Help"),
+    h("p", { class: "muted" }, "Log what happens in a match in three taps, then see who did what, where."),
+    section("1. Set up your squad", true, ul(
+      ["Go to ", b("Squad"), ". Type a shirt number and name, press Enter, repeat."],
+      ["Or ", b("Paste or upload a list"), ": one player per line, like ", h("code", {}, "7 Sam"), ". Spreadsheet CSV files work too."],
+      "Numbers here are each player's usual number. You can change them for any single game.")),
+    section("2. Start a game", false, ul(
+      [b("Games → + New game"), ". Enter the opponent, date and half length."],
+      ["Untick anyone not playing, and change a shirt number for that day if needed."],
+      [b("Start game"), " asks who's starting: tap players onto the pitch, then ", b("Kick off"), "."])),
+    section("3. Log events (three taps)", false, ul(
+      ["Tap ", b("where"), " on the pitch, ", b("what"), " happened, and ", b("who"), ". Any order. It saves on the third tap."],
+      ["Your team always attacks to the ", b("right"), ", in both halves."],
+      ["Green buttons are good for your team, red are bad."],
+      [b("?"), " = one of yours but you didn't see who. ", b("Them"), " = the opposition (a Goal for Them is a goal conceded)."],
+      ["Mistake? Tap ", b("Undo"), " under the clock, or ", b("Delete"), " in the Latest list."]),
+      h("p", { class: "tip" }, "Tip: add the app to your phone's home screen (browser menu → Add to Home Screen) so it's one tap away.")),
+    section("4. Clock, subs and team sheet", false, ul(
+      ["The big button runs the match: ", b("Start game → Half time → Start 2nd half → Full time"), ". Each step can be undone."],
+      ["The clock keeps correct time even if the phone locks."],
+      [b("Subs"), ": tap who's coming off and who's going on, then ", b("Done"), ". Minutes played are counted for you."],
+      [b("Players"), ": change today's numbers or add someone who turned up."])),
+    section("5. See the stats", false, ul(
+      ["Tap ", b("stats →"), " on a game: score, totals, a pitch map, and a table by player with minutes."],
+      ["Filter the map by half, team, or event type. Tap a player in the table to see only theirs."],
+      [b("Download CSV"), " opens in any spreadsheet. ", b("Season totals"), " are on the Games screen."])),
+    section("6. Share with other coaches", false, ul(
+      [b("One game, view only"), ": on its stats page, tick ", b("Share with coaches"), "."],
+      [b("Your whole team, view only"), ": on ", b("Squad"), ", tick ", b("Share my team with coaches"), ". Covers every game, now and later."],
+      [b("Let a coach edit a game"), ": on its stats page, under ", b("Coaches who can edit this game"), ", tick their name. You can both log events at the same time."],
+      ["Only you can share, choose editors, change the team sheet or delete your games."],
+      ["Games others share or let you edit appear on your ", b("Games"), " screen."]),
+      h("p", { class: "tip" }, "The full coaches list is on the Account tab.")),
+    section("7. Accounts, offline and backups", false, ul(
+      ["Everything saves to your Google account after every tap, and syncs to your other devices."],
+      ["No signal? Keep going. It saves on the phone and uploads when you're back online."],
+      [b("Account → Export JSON"), " downloads a spare copy of everything."],
+      [b("New coach?"), " The app's owner adds them in the Firebase console: Firestore → ", h("code", {}, "allow"), " → a document named with their Gmail address in lowercase."])));
+}
+
 // ---- Sign-in gate
 
 function viewGate() {
@@ -515,7 +667,7 @@ function viewGate() {
     ],
     denied: [
       h("p", {}, h("strong", {}, app.user?.email), " doesn't have access to Sideline Stats."),
-      h("p", { class: "muted" }, "Ask the owner to add this Google account to the family list, or sign in with a different account."),
+      h("p", { class: "muted" }, "Ask the app's owner to add this Google account to the coaches list, or sign in with a different account."),
       signOutBtn("Use a different account"),
     ],
     unverifiable: [
@@ -548,10 +700,10 @@ function viewShared() {
   if (!read) {
     return h("section", {}, h("a", { class: "link-btn", href: "#/games" }, "‹ Games"), h("h1", {}, "Can't show this game"), h("p", { class: "muted" }, "Its data couldn't be read."));
   }
-  return viewStats(read.game, { st: read.st, readOnly: true, sharedBy: item.ownerName || "family" });
+  return viewStats(read.game, { st: read.st, readOnly: true, sharedBy: item.ownerName || "another coach" });
 }
 
-// ---- A family member's shared team (view only)
+// ---- Another coach's shared team (view only)
 
 /** A shared game as a readable { st, game }, or null if it can't be read. */
 function readShared(item) {
@@ -582,8 +734,8 @@ function viewTeam() {
   const players = S.activePlayers(st);
   return h("section", {},
     h("a", { class: "link-btn", href: "#/games" }, "‹ Games"),
-    h("h1", { style: "margin-bottom:4px" }, `${team.ownerName || "Family"}'s team`),
-    h("p", { class: "muted" }, "Shared with you, view only."),
+    h("h1", { style: "margin-bottom:4px" }, `${team.ownerName || "A coach"}'s team`),
+    h("p", { class: "muted" }, "Shared with you by another coach, view only."),
     h("h2", {}, `Games (${games.length})`),
     games.length
       ? h("ul", { class: "list", id: "team-games" }, games.map((x) => {
@@ -630,29 +782,41 @@ function viewGames() {
             h("a", { class: "main", href: `#/game/${g.id}` },
               h("div", { class: "primary" }, `vs ${g.opponent}`),
               h("div", { class: "secondary" }, `${fmtDate(g.date)} · ${plural(g.events.length, "event")}`)),
-            g.shared && h("span", { class: "badge", title: "Shared with family (view only)" }, "Shared"),
+            g.shared && h("span", { class: "badge", title: "Shared with coaches (view only)" }, "Shared"),
             h("span", { class: `badge${c.running ? " live" : ""}` }, status),
             h("a", { class: "link-btn", href: `#/game/${g.id}/stats` }, "Stats"));
         }))
       : h("p", { class: "muted", style: "margin-top:16px" }, "No games yet."),
+    app.coGames.length > 0 && [
+      h("h2", {}, "Games you can edit"),
+      h("p", { class: "muted small" }, "Other coaches' games you've been added to. Log events with them as it happens."),
+      h("ul", { class: "list", id: "co-list" }, [...app.coGames].sort((a, b) => (a.game.date < b.game.date ? 1 : -1)).map((x) => {
+        const c = S.clock(x.game);
+        const sc = S.score(x.game);
+        return h("li", {},
+          h("a", { class: "main", href: `#/co/${encodeURIComponent(x.docId)}` },
+            h("div", { class: "primary" }, `vs ${x.game.opponent}`),
+            h("div", { class: "secondary" }, `${fmtDate(x.game.date)} · ${x.ownerName || "another coach"}'s game`)),
+          h("span", { class: `badge${c.running ? " live" : ""}` }, `${sc.us}–${sc.them} · ${c.running ? `${PHASE_LABEL[c.phase]} ${S.formatClock(c.seconds)}` : PHASE_LABEL[c.phase]}`));
+      }))],
     app.sharedTeams.length > 0 && [
       h("h2", {}, "Teams shared with me"),
       h("ul", { class: "list", id: "shared-teams" }, app.sharedTeams.map((t) => {
         const n = app.shared.filter((x) => x.owner === t.uid).length;
         return h("li", {},
           h("a", { class: "main", href: `#/team/${encodeURIComponent(t.uid)}` },
-            h("div", { class: "primary" }, `${t.ownerName || "Family"}'s team`),
+            h("div", { class: "primary" }, `${t.ownerName || "A coach"}'s team`),
             h("div", { class: "secondary" }, `${plural((t.players ?? []).filter((p) => !p.removed).length, "player")} · ${plural(n, "game")} · view only`)));
       }))],
     sharedGamesOnly().length > 0 && [
       h("h2", {}, "Games shared with me"),
-      h("p", { class: "muted small" }, "Single games family members have shared. View only."),
+      h("p", { class: "muted small" }, "Single games other coaches have shared. View only."),
       h("ul", { class: "list", id: "shared-list" }, sharedGamesOnly().sort((a, b) => (a.game.date < b.game.date ? 1 : -1)).map((x) => {
         const sc = S.score(x.game);
         return h("li", {},
           h("a", { class: "main", href: `#/shared/${encodeURIComponent(x.docId)}` },
             h("div", { class: "primary" }, `vs ${x.game.opponent}`),
-            h("div", { class: "secondary" }, `${fmtDate(x.game.date)} · by ${x.ownerName || "family"}`)),
+            h("div", { class: "secondary" }, `${fmtDate(x.game.date)} · by ${x.ownerName || "another coach"}`)),
           h("span", { class: "badge" }, `${sc.us}–${sc.them} · ${PHASE_LABEL[S.phase(x.game)]}`));
       }))],
     season.byPlayer.size > 0 && [h("h2", {}, "Season totals"), statsTable(season, { selectable: false, minutes: S.seasonPlayingTime(st) })],
@@ -704,15 +868,27 @@ function viewNewGame() {
 
 // ---- Live entry
 
+/**
+ * Where a game lives: your own (st = your squad and games) or another coach's
+ * that you can edit (co = that entry, st = its player names).
+ */
+function ctxFor(game) {
+  const co = app.coGames.find((x) => x.game.id === game.id) ?? null;
+  return { st: co ? co.st : app.state, co };
+}
+const liveHref = (game) => { const { co } = ctxFor(game); return co ? `#/co/${encodeURIComponent(co.docId)}` : `#/game/${game.id}`; };
+
 /** The team sheet for this game: [{ id, number (worn today), name }], by number. */
 function matchdayPlayers(game) {
+  const { st } = ctxFor(game);
   return game.roster.map((r) => {
-    const p = app.state.players.find((p) => p.id === r.playerId);
+    const p = st.players.find((p) => p.id === r.playerId);
     return { id: r.playerId, number: r.number, name: p?.name ?? "" };
   });
 }
 
 function viewLive(game) {
+  const { co } = ctxFor(game);
   if (app.pending?.gameId !== game.id) app.pending = { gameId: game.id };
   const pend = app.pending;
   const c = S.clock(game);
@@ -741,7 +917,7 @@ function viewLive(game) {
           h("span", { class: "phase-label", id: "phase-label" }, PHASE_LABEL[c.phase]))),
       next
         ? h("button", { type: "button", class: "btn phase-btn", id: "phase-btn", onclick: () => phaseAction(game) }, next)
-        : h("a", { class: "btn btn-quiet phase-btn", href: `#/game/${game.id}/stats` }, "Stats")),
+        : h("a", { class: "btn btn-quiet phase-btn", href: `${liveHref(game)}/stats` }, "Stats")),
     h("div", { class: "live-status", id: "live-status", role: "status", "aria-live": "polite" }, liveStatusContent()),
     h("div", { class: "pitch-wrap" }, pitch),
     [true, false].map((positive) => h("div", {
@@ -768,9 +944,11 @@ function viewLive(game) {
       h("button", { type: "button", class: "btn btn-quiet btn-small", disabled: !(pend.x != null || pend.type || pend.playerId !== undefined),
         onclick: () => { app.pending = { gameId: game.id }; render(); } }, "Clear"),
       h("button", { type: "button", class: "btn btn-quiet btn-small", id: "subs-btn", disabled: c.phase === "full" || !game.roster.length, onclick: () => subsDialog(game) }, "Subs"),
-      h("button", { type: "button", class: "btn btn-quiet btn-small", onclick: () => editMatchday(game) }, "Players")),
+      // The team sheet belongs to the game's creator.
+      co ? h("span", { class: "muted small co-note" }, `${co.ownerName || "Another coach"}'s game`)
+        : h("button", { type: "button", class: "btn btn-quiet btn-small", onclick: () => editMatchday(game) }, "Players")),
     h("div", { class: "recent" },
-      h("div", { class: "step" }, h("h2", {}, "Latest"), h("a", { class: "link-btn small", href: `#/game/${game.id}/stats`, id: "to-stats" }, `All ${game.events.length} · stats →`)),
+      h("div", { class: "step" }, h("h2", {}, "Latest"), h("a", { class: "link-btn small", href: `${liveHref(game)}/stats`, id: "to-stats" }, `All ${game.events.length} · stats →`)),
       recent.length
         ? h("ul", { class: "list", id: "recent" }, recent.map((e) => eventRow(game, e)))
         : h("p", { class: "muted small" }, "Tap where, what and who, in any order. It saves when all three are chosen.")));
@@ -780,18 +958,19 @@ function afterPick(game) {
   const p = app.pending;
   if (p.x != null && p.type && p.playerId !== undefined) {
     const team = p.playerId === "them" ? "them" : "us";
-    const ev = commit((st) => S.addEvent(st, game, { type: p.type, team, playerId: team === "them" ? null : p.playerId, x: p.x, y: p.y }), { rerender: false });
+    const { st } = ctxFor(game);
+    const ev = commit(() => S.addEvent(st, game, { type: p.type, team, playerId: team === "them" ? null : p.playerId, x: p.x, y: p.y }), { rerender: false });
     app.pending = { gameId: game.id };
     navigator.vibrate?.(30);
     render();
-    toast(`${ev.type === "goal" ? (team === "them" ? "Conceded: " : "GOAL! ") : ""}${S.minuteLabel(ev, game.halfLength)} ${S.eventPlayerLabel(app.state, ev)} · ${S.eventType(ev.type).label}`,
+    toast(`${ev.type === "goal" ? (team === "them" ? "Conceded: " : "GOAL! ") : ""}${S.minuteLabel(ev, game.halfLength)} ${S.eventPlayerLabel(st, ev)} · ${S.eventType(ev.type).label}`,
       () => commit(() => S.deleteEvent(current(game), ev.id)));
   } else {
     render();
   }
 }
 
-function eventRow(game, e, { st = app.state, readOnly = false } = {}) {
+function eventRow(game, e, { st = ctxFor(game).st, readOnly = false } = {}) {
   return h("li", { "data-event-id": e.id },
     h("span", { class: "muted small", style: "width:52px;flex:none;font-variant-numeric:tabular-nums" }, S.minuteLabel(e, game.halfLength)),
     symbolIcon(e.type, 18),
@@ -869,7 +1048,7 @@ function subsDialog(game, { kickOff } = {}) {
     body,
     okLabel: kickOff ? "Kick off" : "Done",
     onOk: () => {
-      const sub = commit(() => S.setOnPitch(app.state, current(game), [...on]));
+      const sub = commit(() => S.setOnPitch(ctxFor(game).st, current(game), [...on]));
       if (kickOff) {
         kickOff();
       } else if (sub) {
@@ -999,7 +1178,8 @@ function pitchSvg({ marks, pending, onTap, label, highlight }) {
  * Game stats. For a game someone has shared with you, st holds just that game's
  * player names and readOnly hides every editing control.
  */
-function viewStats(game, { st = app.state, readOnly = false, sharedBy = null } = {}) {
+function viewStats(game, { st = app.state, readOnly = false, sharedBy = null, co = null } = {}) {
+  const owner = !readOnly && !co; // only the creator can share, pick editors, edit details or delete
   const f = app.statsFilter;
   if (f.gameId !== game.id) Object.assign(f, { gameId: game.id, half: 0, types: new Set(S.EVENT_IDS), playerId: undefined, team: "us" });
   const inHalf = game.events.filter((e) => !f.half || e.half === f.half);
@@ -1012,13 +1192,14 @@ function viewStats(game, { st = app.state, readOnly = false, sharedBy = null } =
 
   return h("section", {},
     h("div", { class: "step", style: "margin:4px 0 12px" },
-      readOnly ? h("a", { class: "link-btn", href: "#/games" }, "‹ Games") : h("a", { class: "link-btn", href: `#/game/${game.id}` }, "‹ Back to game"),
+      readOnly ? h("a", { class: "link-btn", href: "#/games" }, "‹ Games") : h("a", { class: "link-btn", href: liveHref(game) }, "‹ Back to game"),
       h("span", { class: `badge${c.running ? " live" : ""}` }, c.running ? `${PHASE_LABEL[c.phase]} ${S.formatClock(c.seconds)}` : PHASE_LABEL[c.phase])),
     h("h1", { style: "margin-bottom:4px" }, `vs ${game.opponent}`, " ", h("span", { class: "score big", id: "stats-score" }, `${S.score(game).us}–${S.score(game).them}`)),
-    h("p", { class: "muted" }, fmtDate(game.date), sharedBy && ` · shared by ${sharedBy} (view only)`),
-    !readOnly && h("label", { class: "share-toggle" },
-      h("input", { type: "checkbox", id: "share-toggle", checked: game.shared === true, onchange: (e) => commit(() => { game.shared = e.target.checked; }) }),
-      h("span", {}, h("strong", {}, "Share with family"), h("br"), h("span", { class: "muted small" }, "Everyone on your family list can view this game. Only you can change it."))),
+    h("p", { class: "muted" }, fmtDate(game.date), sharedBy && ` · shared by ${sharedBy} (view only)`, co && ` · ${co.ownerName || "another coach"}'s game, you can edit`),
+    owner && h("label", { class: "share-toggle" },
+      h("input", { type: "checkbox", id: "share-toggle", checked: game.shared === true, onchange: (e) => commit(() => { current(game).shared = e.target.checked; if (!e.target.checked) delete current(game).shared; }) }),
+      h("span", {}, h("strong", {}, "Share with coaches"), h("br"), h("span", { class: "muted small" }, "Every coach can view this game. Only you, and editors below, can change it."))),
+    owner && editorsPicker(game),
     h("div", { class: "chips", role: "group", "aria-label": "Half" },
       [["Both halves", 0], ["1st half", 1], ["2nd half", 2]].map(([label, v]) =>
         h("button", { type: "button", class: "chip", "aria-pressed": String(f.half === v), onclick: () => { f.half = v; render(); } }, label))),
@@ -1057,11 +1238,34 @@ function viewStats(game, { st = app.state, readOnly = false, sharedBy = null } =
     h("h2", {}, "Game"),
     h("div", { class: "row", style: "flex-wrap:wrap" },
       h("button", { type: "button", class: "btn btn-quiet", onclick: () => download(`${game.date}-vs-${game.opponent.replace(/[^\w-]+/g, "-")}.csv`, S.gameCSV(st, game), "text/csv") }, "Download CSV"),
-      !readOnly && h("button", { type: "button", class: "btn btn-quiet", onclick: () => editGame(game) }, "Edit details"),
-      !readOnly && h("button", { type: "button", class: "btn btn-danger", onclick: () => openDialog({
+      owner && h("button", { type: "button", class: "btn btn-quiet", onclick: () => editGame(game) }, "Edit details"),
+      owner && h("button", { type: "button", class: "btn btn-danger", onclick: () => openDialog({
         title: `Delete game vs ${game.opponent}?`, body: h("p", {}, `This deletes its ${plural(game.events.length, "event")}. It can't be undone unless you have an export.`),
         okLabel: "Delete", danger: true, onOk: () => { commit(() => S.deleteGame(st, game.id), { rerender: false }); go("#/games"); },
       }) }, "Delete game")));
+}
+
+/** The creator picks which coaches can edit this game alongside them. */
+function editorsPicker(game) {
+  const me = app.user?.email;
+  const others = app.coaches.filter((c) => c.email !== me);
+  const editors = new Set(game.editors ?? []);
+  return h("div", { class: "card editors", id: "editors" },
+    h("strong", {}, "Coaches who can edit this game"),
+    h("p", { class: "muted small", style: "margin:4px 0 8px" }, "They can log events, run the clock and make subs with you, at the same time. Only you can change this list, share, or delete the game."),
+    others.length
+      ? others.map((c) => h("label", { class: "editor-row" },
+          h("input", {
+            type: "checkbox", checked: editors.has(c.email), "data-email": c.email,
+            onchange: (e) => commit(() => {
+              const g = current(game);
+              const set = new Set(g.editors ?? []);
+              e.target.checked ? set.add(c.email) : set.delete(c.email);
+              if (set.size) g.editors = [...set].sort(); else delete g.editors;
+            }),
+          }),
+          h("span", {}, c.name ? `${c.name} ` : "", h("span", { class: "muted small" }, c.email))))
+      : h("p", { class: "muted small", style: "margin:0" }, "No other coaches on the list yet. Add them in the Firebase console (see Account)."));
 }
 
 /** With a game, players are labelled and sorted by the number they wore in it. */
@@ -1123,9 +1327,9 @@ function viewSquad() {
   return h("section", {},
     h("h1", {}, "Squad"),
     h("label", { class: "share-toggle" },
-      h("input", { type: "checkbox", id: "share-team", checked: app.state.shareTeam === true, onchange: (e) => commit((st) => { st.shareTeam = e.target.checked; }) }),
-      h("span", {}, h("strong", {}, "Share my team with family"), h("br"),
-        h("span", { class: "muted small" }, "Everyone on your family list can view your squad, season stats and all your games. Only you can change them."))),
+      h("input", { type: "checkbox", id: "share-team", checked: app.state.shareTeam === true, onchange: (e) => commit((st) => { if (e.target.checked) st.shareTeam = true; else delete st.shareTeam; }) }),
+      h("span", {}, h("strong", {}, "Share my team with coaches"), h("br"),
+        h("span", { class: "muted small" }, "Every coach can view your squad, season stats and all your games. Only you, and a game's editors, can change them."))),
     h("p", { class: "muted small" }, "Everyone who might play, with their usual number. For each game you pick who's playing and can change numbers for that day."),
     h("form", {
       novalidate: true,
@@ -1220,6 +1424,14 @@ function viewData() {
         ? "Your squad and games save to your account after every tap, and a copy is kept on this phone so it works without signal. Changes made offline upload when you reconnect."
         : "Working offline from this phone's copy. Changes will upload next time the app opens with a connection."),
       h("button", { type: "button", class: "btn btn-quiet btn-small", id: "sign-out", onclick: () => cloud?.signOut() }, "Sign out")),
+    h("h2", {}, `Coaches (${app.coaches.length})`),
+    h("p", { class: "muted small" }, "Everyone who can use Sideline Stats. Share a game or your team with all of them, or pick editors on a game's stats page."),
+    app.coaches.length
+      ? h("ul", { class: "list", id: "coaches" }, app.coaches.map((c) => h("li", {},
+          h("div", { class: "main" }, h("div", { class: "primary" }, c.name || c.email, c.email === app.user?.email ? " (you)" : ""), c.name && h("div", { class: "secondary" }, c.email)))))
+      : h("p", { class: "muted small" }, "Loading…"),
+    h("p", { class: "muted small", style: "margin-top:8px" }, "To add or remove a coach: Firebase console → Firestore → ", h("code", {}, "allow"),
+      " collection. Add a document whose ID is their Gmail address in lowercase, with a ", h("code", {}, "name"), " field."),
     h("div", { class: "card" },
       h("p", { class: "muted small", style: "margin:0" }, `${plural(S.activePlayers(st).length, "player")}, ${plural(st.games.length, "game")}, ${plural(events, "event")}.`)),
     h("h2", {}, "Back up"),
@@ -1243,8 +1455,9 @@ function viewData() {
 // ---------------------------------------------------------------- clock & screen
 
 function tick() {
-  if (app.route.name !== "live") return;
-  const game = findGame(app.route.id);
+  const r = app.route;
+  if (r.name !== "live" && r.name !== "co") return;
+  const game = r.name === "live" ? findGame(r.id) : app.coGames.find((x) => x.docId === r.docId)?.game;
   const el = document.getElementById("clock");
   if (game && el) el.textContent = S.formatClock(S.clock(game).seconds);
 }
@@ -1267,7 +1480,7 @@ async function updateWakeLock(want) {
 }
 document.addEventListener("visibilitychange", () => {
   // Coming back to the live screen: refresh the clock and re-acquire the wake lock.
-  if (document.visibilityState === "visible" && app.route.name === "live") render();
+  if (document.visibilityState === "visible" && ["live", "co"].includes(app.route.name)) render();
 });
 
 window.addEventListener("storage", (e) => {

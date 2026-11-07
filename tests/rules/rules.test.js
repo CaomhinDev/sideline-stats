@@ -3,7 +3,7 @@
 import { test, before, after, beforeEach } from "node:test";
 import { readFileSync } from "node:fs";
 import { initializeTestEnvironment, assertSucceeds, assertFails } from "@firebase/rules-unit-testing";
-import { doc, getDoc, setDoc, updateDoc, deleteDoc, collection, query, where, getDocs } from "firebase/firestore";
+import { doc, getDoc, setDoc, updateDoc, deleteDoc, collection, query, where, getDocs, arrayUnion } from "firebase/firestore";
 
 let env;
 const ME = { uid: "me", email: "me@example.com" };
@@ -33,11 +33,15 @@ beforeEach(async () => {
   });
 });
 
-test("you can check your own allowlist entry, but not anyone else's or the list", async () => {
+test("coaches can see the coaches list; nobody else can", async () => {
   await assertSucceeds(getDoc(doc(as(ME), "allow/me@example.com")));
-  await assertSucceeds(getDoc(doc(as(BRO), "allow/brother@example.com")));
-  await assertFails(getDoc(doc(as(ME), "allow/brother@example.com")));
-  await assertFails(getDocs(collection(as(ME), "allow")));
+  const list = await assertSucceeds(getDocs(collection(as(ME), "allow")));
+  if (list.size !== 2) throw new Error(`expected 2 coaches, got ${list.size}`);
+  await assertFails(getDocs(collection(as(STRANGER), "allow")));
+  await assertFails(getDocs(collection(env.unauthenticatedContext().firestore(), "allow")));
+  // A stranger may check their own (missing) entry, nothing more.
+  await assertSucceeds(getDoc(doc(as(STRANGER), "allow/stranger@example.com")));
+  await assertFails(getDoc(doc(as(STRANGER), "allow/me@example.com")));
 });
 
 test("nobody can change the allowlist from the app", async () => {
@@ -118,4 +122,47 @@ test("removing someone from the allowlist cuts off access, even to their own gam
   await env.withSecurityRulesDisabled((ctx) => deleteDoc(doc(ctx.firestore(), "allow/brother@example.com")));
   await assertFails(getDoc(doc(as(BRO), "games/bro_3")));
   await assertFails(getDoc(doc(as(BRO), "games/me_2")));
+});
+
+// ---- Per-game editors
+
+async function seedEditable() {
+  await env.withSecurityRulesDisabled((ctx) =>
+    setDoc(doc(ctx.firestore(), "games/me_20"), { owner: "me", ownerName: "me", shared: false, editors: ["brother@example.com"], game: { id: 20, events: [] } }));
+}
+
+test("an editor can see and edit the game itself, even unshared", async () => {
+  await seedEditable();
+  const db = as(BRO);
+  await assertSucceeds(getDoc(doc(db, "games/me_20")));
+  await assertSucceeds(updateDoc(doc(db, "games/me_20"), { "game.events": arrayUnion({ id: 1, type: "goal" }) }));
+  await assertSucceeds(updateDoc(doc(db, "games/me_20"), { "game.periods": [{ start: 1, end: null }], updated: 5 }));
+  const mine = await assertSucceeds(getDocs(query(collection(db, "games"), where("editors", "array-contains", "brother@example.com"))));
+  if (mine.size !== 1) throw new Error(`expected 1 editable game, got ${mine.size}`);
+});
+
+test("an editor can't change who edits, sharing, ownership, or delete", async () => {
+  await seedEditable();
+  const db = as(BRO);
+  await assertFails(updateDoc(doc(db, "games/me_20"), { editors: ["brother@example.com", "x@example.com"] }));
+  await assertFails(updateDoc(doc(db, "games/me_20"), { shared: true }));
+  await assertFails(updateDoc(doc(db, "games/me_20"), { owner: "bro" }));
+  await assertFails(updateDoc(doc(db, "games/me_20"), { "game.id": 99 }));
+  await assertFails(deleteDoc(doc(db, "games/me_20")));
+});
+
+test("coaches who aren't editors can't edit, and the owner controls editors", async () => {
+  await seedEditable();
+  await env.withSecurityRulesDisabled((ctx) => setDoc(doc(ctx.firestore(), "allow/third@example.com"), {}));
+  const third = env.authenticatedContext("third", { email: "third@example.com", email_verified: true }).firestore();
+  await assertFails(getDoc(doc(third, "games/me_20")));
+  await assertFails(updateDoc(doc(third, "games/me_20"), { "game.events": arrayUnion({ id: 2 }) }));
+  await assertSucceeds(updateDoc(doc(as(ME), "games/me_20"), { editors: [] }));
+  await assertFails(getDoc(doc(as(BRO), "games/me_20"))); // removed: no longer visible
+});
+
+test("a removed coach loses editing even if still listed on a game", async () => {
+  await seedEditable();
+  await env.withSecurityRulesDisabled((ctx) => deleteDoc(doc(ctx.firestore(), "allow/brother@example.com")));
+  await assertFails(updateDoc(doc(as(BRO), "games/me_20"), { "game.events": arrayUnion({ id: 3 }) }));
 });

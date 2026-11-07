@@ -1,13 +1,14 @@
 rules_version = '2';
 
 // Sideline Stats access rules.
-// - Only Google accounts listed in /allow/{email} can use the app at all. That list
-//   is managed in the Firebase console (it is never readable or writable by the app,
-//   except that you can check your own entry).
+// - Only Google accounts listed in /allow/{email} (the coaches) can use the app at
+//   all. The list is managed in the Firebase console; coaches can see it but the
+//   app can never change it.
 // - Your squad lives in /users/{uid}; only you can change it. If you share your
-//   team, everyone on the allowlist can view it (and all your games are shared).
-// - Each game is /games/{uid}_{id}. Only its creator can change it. If the creator
-//   marks it shared, everyone on the allowlist can view it (read only).
+//   team, every coach can view it (and all your games are shared).
+// - Each game is /games/{uid}_{id}. Its creator controls it. If marked shared,
+//   every coach can view it. Coaches listed in its `editors` can also edit the
+//   game itself (events, clock, subs), but not who can edit, sharing, or delete.
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -29,27 +30,41 @@ service cloud.firestore {
       return data.owner == request.auth.uid;
     }
 
-    match /allow/{address} {
-      allow get: if signedIn() && address == email();
-      allow list, write: if false;
+    function isEditor(data) {
+      return email() in data.get('editors', []);
     }
 
-    // Your squad. If you share your team, family can read it (never change it).
+    match /allow/{address} {
+      allow get: if signedIn() && address == email();
+      allow list: if allowed();
+      allow write: if false;
+    }
+
+    // Your squad. If you share your team, coaches can read it (never change it).
     match /users/{uid} {
       allow read: if allowed() && (request.auth.uid == uid || resource.data.shared == true);
       allow write: if allowed() && request.auth.uid == uid;
     }
 
     match /games/{gameId} {
-      allow read: if allowed() && (isOwner(resource.data) || resource.data.shared == true);
+      allow read: if allowed()
+        && (isOwner(resource.data) || resource.data.shared == true || isEditor(resource.data));
       allow create: if allowed()
         && isOwner(request.resource.data)
         && gameId.matches(request.auth.uid + '_[0-9]+')
-        && request.resource.data.shared is bool;
-      allow update: if allowed()
-        && isOwner(resource.data)
-        && isOwner(request.resource.data)
-        && request.resource.data.shared is bool;
+        && request.resource.data.shared is bool
+        && request.resource.data.get('editors', []) is list;
+      // The owner can change anything except handing the game to someone else.
+      // An editor can only change the game itself (and its timestamp).
+      allow update: if allowed() && (
+        (isOwner(resource.data)
+          && isOwner(request.resource.data)
+          && request.resource.data.shared is bool
+          && request.resource.data.get('editors', []) is list)
+        || (isEditor(resource.data)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['game', 'updated'])
+          && request.resource.data.game.id == resource.data.game.id)
+      );
       allow delete: if allowed() && isOwner(resource.data);
     }
 

@@ -358,3 +358,13 @@ test("team sharing survives export and import", () => {
   assert.equal(S.parseState(JSON.stringify(S.toExport(st))).shareTeam, true);
   assert.equal(S.parseState(JSON.stringify(S.toExport(S.emptyState()))).shareTeam, undefined);
 });
+
+test("game editors are kept, lowercased and de-duplicated", () => {
+  const st = S.emptyState();
+  const g = S.createGame(st, { opponent: "R", halfLength: 30 }).game;
+  g.editors = ["Coach@Example.com", "coach@example.com", "x@example.com", 7, "nope"];
+  const back = S.parseState(JSON.stringify(S.toExport(st))).games[0];
+  assert.deepEqual(back.editors, ["coach@example.com", "x@example.com"]);
+  delete g.editors;
+  assert.equal("editors" in S.parseState(JSON.stringify(S.toExport(st))).games[0], false);
+});

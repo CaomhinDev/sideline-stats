@@ -21,7 +21,8 @@ async function newGame(page, opponent = "Rovers", half = "30") {
 /** Taps the pitch at a fraction of its width/height (0,0 = top-left, our goal on the left). */
 async function tapPitch(page, fx, fy) {
   const pitch = page.locator("#pitch");
-  const box = await pitch.boundingBox();
+  // Size via the element itself (click retries if a sync redraws the pitch meanwhile).
+  const box = await pitch.evaluate((el) => el.getBoundingClientRect().toJSON());
   // viewBox has 1 unit padding around a 105x68 pitch.
   await pitch.click({ position: { x: ((1 + fx * 105) / 107) * box.width, y: ((1 + fy * 68) / 70) * box.height } });
 }
@@ -632,4 +633,92 @@ test.describe("signing out and sharing a team", () => {
     await expect(sis.locator("#shared-list li", { hasText: opponent })).toHaveCount(0);
     await ctx.close();
   });
+});
+
+test.describe("coaches and per-game editors", () => {
+  test.use({ signIn: false });
+
+  /** Opens a second signed-in "phone" for another coach. */
+  async function coachPhone(browser, page, email) {
+    const ctx = await browser.newContext({ ...test.info().project.use });
+    const p2 = await ctx.newPage();
+    await p2.addInitScript(() => { window.__SIDELINE_EMULATOR = true; });
+    await p2.goto(new URL("./", page.url()).href);
+    await signInAs(p2, email);
+    return { ctx, page: p2 };
+  }
+
+  test("the Account tab lists the coaches", async ({ page }) => {
+    const me = freshEmail("me");
+    const other = freshEmail("other");
+    await allow(me);
+    await allow(other);
+    await page.goto("./");
+    await signInAs(page, me);
+    await page.goto("./#/data");
+    await expect(page.locator("#coaches")).toContainText(`${me} (you)`);
+    await expect(page.locator("#coaches")).toContainText(other);
+  });
+
+  test("an editor logs events in the creator's game, at the same time as the creator", async ({ page, browser }) => {
+    const owner = freshEmail("owner");
+    const helper = freshEmail("helper");
+    await allow(owner);
+    await allow(helper);
+    await page.goto("./");
+    await signInAs(page, owner);
+    await addSquad(page, "4 Chris\n9 Jordan");
+    const opponent = `Edit FC ${Date.now()}`;
+    await newGame(page, opponent);
+
+    // Not an editor yet: the helper doesn't see it.
+    const { ctx, page: coach } = await coachPhone(browser, page, helper);
+    await expect(coach.locator("#co-list li", { hasText: opponent })).toHaveCount(0);
+
+    // Owner adds the helper as an editor from the game's stats page.
+    await page.locator("#to-stats").click();
+    await page.locator(`#editors input[data-email="${helper}"]`).check();
+    const row = coach.locator("#co-list li", { hasText: opponent });
+    await expect(row).toHaveCount(1);
+    await row.locator("a").click();
+    await expect(coach.locator(".live-head .opp")).toContainText(opponent);
+    // Owner-only controls are hidden for an editor.
+    await expect(coach.getByRole("button", { name: "Players", exact: true })).toHaveCount(0);
+
+    // Both log an event at the same moment: neither is lost.
+    await page.getByRole("link", { name: "‹ Back to game" }).click();
+    const log = async (p, type, n, fx) => { await p.locator(`[data-event="${type}"]`).click(); await p.locator(`.pl-btn[data-number="${n}"]`).click(); await tapPitch(p, fx, 0.5); };
+    await Promise.all([log(page, "tackle_won", 4, 0.3), log(coach, "goal", 9, 0.95)]);
+    await expect(page.locator("#recent li")).toHaveCount(2);
+    await expect(coach.locator("#recent li")).toHaveCount(2);
+    await expect(page.locator("#score")).toHaveText("1–0");
+    await expect(coach.locator("#score")).toHaveText("1–0");
+
+    // The editor can run the clock too; the owner sees it.
+    await coach.locator("#phase-btn").click();
+    await coach.locator("#dialog-ok").click(); // kick off without picking a lineup
+    await expect(page.locator("#phase-label")).toHaveText("1st half");
+
+    // An editor can't share, pick editors or delete.
+    await coach.locator("#to-stats").click();
+    await expect(coach.locator("#share-toggle")).toHaveCount(0);
+    await expect(coach.locator("#editors")).toHaveCount(0);
+    await expect(coach.getByRole("button", { name: "Delete game" })).toHaveCount(0);
+
+    // Removing the editor takes the game away from them.
+    await page.locator("#to-stats").click();
+    await page.locator(`#editors input[data-email="${helper}"]`).uncheck();
+    await expect(coach.locator("h1")).toHaveText("Not available");
+    await ctx.close();
+  });
+});
+
+test("the Help tab explains the essentials", async ({ page }) => {
+  await page.getByRole("link", { name: "Help" }).click();
+  await expect(page.locator("#help h1")).toHaveText("Help");
+  await expect(page.locator("#help summary")).toHaveCount(7);
+  await page.locator("#help summary", { hasText: "Share with other coaches" }).click();
+  await expect(page.locator("#help")).toContainText("Coaches who can edit this game");
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+  expect(overflow).toBeLessThanOrEqual(0);
 });

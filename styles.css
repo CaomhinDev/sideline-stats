@@ -77,7 +77,7 @@ p { margin: 0 0 12px; }
 @media (max-width: 760px) { .banner { margin: 8px 16px 0; } }
 
 .tabs {
-  position: fixed; inset: auto 0 0 0; display: grid; grid-template-columns: repeat(3, 1fr);
+  position: fixed; inset: auto 0 0 0; display: grid; grid-template-columns: repeat(4, 1fr);
   background: var(--surface); border-top: 1px solid var(--border); padding-bottom: env(safe-area-inset-bottom);
 }
 .tabs a { text-align: center; text-decoration: none; color: var(--text-2); font-weight: 600; padding: 18px 4px; }
@@ -270,3 +270,15 @@ tr.them-row td { color: var(--text-2); font-weight: 600; }
 .share-toggle input { width: 22px; height: 22px; margin-top: 2px; flex: none; }
 .signed-in-as { margin-top: 28px; text-align: center; }
 .signed-in-as .link-btn { padding: 4px 6px; min-height: 0; text-decoration: underline; }
+.editors .editor-row { display: flex; align-items: center; gap: 10px; font-weight: 500; margin: 0; padding: 8px 0; border-top: 1px solid var(--border); cursor: pointer; }
+.editors .editor-row input { width: 22px; height: 22px; flex: none; }
+.co-note { align-self: center; justify-self: center; text-align: center; }
+code { font-family: ui-monospace, monospace; font-size: 0.9em; background: var(--surface-2); padding: 1px 4px; border-radius: 4px; }
+
+/* Help */
+.help details { border-bottom: 1px solid var(--border); }
+.help summary { cursor: pointer; font-weight: 700; padding: 14px 0; list-style-position: inside; }
+.help details[open] summary { padding-bottom: 6px; }
+.help ul, .help ol { margin: 0 0 14px; padding-left: 20px; }
+.help li { margin: 4px 0; }
+.help .tip { color: var(--text-2); font-size: 0.9rem; }
