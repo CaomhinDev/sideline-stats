@@ -458,9 +458,11 @@ test("team name is required, stamped on new games, and round-trips", () => {
   const st = S.emptyState();
   st.teamName = "Ballyhale U12";
   const g = S.createGame(st, { opponent: "Rovers", halfLength: 30 }).game;
-  assert.equal(S.matchTitle(g, "Renamed"), "Ballyhale U12 vs Rovers");
+  assert.equal(g.team, "Ballyhale U12");
+  assert.equal(S.matchTitle(g, ""), "Ballyhale U12 vs Rovers"); // saved name, when the current one isn't known
+  assert.equal(S.matchTitle(g, "Renamed"), "Renamed vs Rovers"); // the current name wins
   delete g.team;
-  assert.equal(S.matchTitle(g, "Renamed"), "Renamed vs Rovers");
+  assert.equal(S.matchTitle(g, ""), "Us vs Rovers");
   g.team = "Ballyhale U12";
   S.advancePhase(g, 0);
   S.pauseClock(g, MIN);

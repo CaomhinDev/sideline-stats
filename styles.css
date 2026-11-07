@@ -99,7 +99,7 @@ p { margin: 0 0 12px; }
 .link-btn:hover { background: var(--surface-2); color: var(--text); }
 
 label { display: block; font-weight: 600; margin-bottom: 6px; }
-input[type="text"], input[type="date"], input[type="number"], input:not([type]), textarea, select {
+input[type="text"], input[type="email"], input[type="date"], input[type="number"], input:not([type]), textarea, select {
   width: 100%; font: inherit; color: var(--text); background: var(--surface);
   border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; min-height: 44px;
 }
@@ -272,8 +272,13 @@ tr.them-row td { color: var(--text-2); font-weight: 600; }
 .share-toggle input { width: 22px; height: 22px; margin-top: 2px; flex: none; }
 .signed-in-as { margin-top: 28px; text-align: center; }
 .signed-in-as .link-btn { padding: 4px 6px; min-height: 0; text-decoration: underline; }
-.editors .editor-row { display: flex; align-items: center; gap: 10px; font-weight: 500; margin: 0; padding: 8px 0; border-top: 1px solid var(--border); cursor: pointer; }
-.editors .editor-row input { width: 22px; height: 22px; flex: none; }
+/* Admin: names on their own line, actions underneath. */
+#admin .list li { flex-wrap: wrap; column-gap: 16px; row-gap: 2px; }
+#admin .list .main { flex-basis: 100%; }
+#admin .list .link-btn { padding-left: 0; }
+.editors .editor-row, #edit-teams .editor-row { display: flex; align-items: center; gap: 10px; font-weight: 500; margin: 0; padding: 8px 0; border-top: 1px solid var(--border); cursor: pointer; }
+#edit-teams .editor-row .muted { font-weight: 400; display: block; overflow-wrap: anywhere; }
+.editors .editor-row input, #edit-teams .editor-row input { width: 22px; height: 22px; flex: none; }
 .co-note { align-self: center; justify-self: center; text-align: center; }
 code { font-family: ui-monospace, monospace; font-size: 0.9em; background: var(--surface-2); padding: 1px 4px; border-radius: 4px; }
 

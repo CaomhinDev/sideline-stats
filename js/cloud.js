@@ -72,21 +72,32 @@ export async function testSignIn(email) {
   await signInWithCredential(auth, GoogleAuthProvider.credential(token));
 }
 
+/** An allowlist entry as { role, team, edits }: edits = uids of teams this coach can edit live. */
+function accessOf(d) {
+  const role = ["admin", "coach", "player"].includes(d.role) ? d.role : "coach";
+  const edits = role !== "player" && Array.isArray(d.edits) ? d.edits.filter((x) => typeof x === "string") : [];
+  return { role, team: role === "player" ? String(d.team ?? "") : null, edits };
+}
+
 /**
- * This account's access: { role: "admin" | "coach" | "player", team } when it's on
+ * This account's access: { role: "admin" | "coach" | "player", team, edits } when it's on
  * the list, false when it isn't, or null when it can't be checked (offline).
  */
 export async function getAccess(user) {
   try {
     const snap = await getDoc(doc(db, "allow", user.email));
-    if (!snap.exists()) return false;
-    const d = snap.data();
-    const role = ["admin", "coach", "player"].includes(d.role) ? d.role : "coach";
-    return { role, team: role === "player" ? String(d.team ?? "") : null };
+    return snap.exists() ? accessOf(snap.data()) : false;
   } catch (e) {
     if (e?.code === "permission-denied") return false;
     return null;
   }
+}
+
+/** Live changes to this account's access (role, team edit rights), or false once removed. */
+export function watchAccess(user, cb, onError) {
+  return onSnapshot(doc(db, "allow", user.email), (snap) => {
+    if (!snap.metadata.fromCache) cb(snap.exists() ? accessOf(snap.data()) : false);
+  }, onError);
 }
 
 export async function isAllowed(user) {
@@ -103,6 +114,8 @@ export function addPerson(email, { name, role, team }, addedBy) {
 }
 
 export const setRole = (email, role) => updateDoc(doc(db, "allow", email), { role });
+/** Admins: the teams (owner uids) a coach can edit live. */
+export const setEdits = (email, uids) => updateDoc(doc(db, "allow", email), { edits: uids });
 export const removePerson = (email) => deleteDoc(doc(db, "allow", email));
 
 /** For a player: their team's squad doc and games, live. cb(team | null, games). */
@@ -195,7 +208,7 @@ export function watchPeople(cb, onError) {
     cb(snap.docs.map((d) => {
       const x = d.data();
       const role = ["admin", "coach", "player"].includes(x.role) ? x.role : "coach";
-      return { email: d.id, name: String(x.name ?? ""), role, team: x.team ?? null };
+      return { email: d.id, name: String(x.name ?? ""), role, team: x.team ?? null, edits: Array.isArray(x.edits) ? x.edits : [] };
     }).sort((a, b) => (a.name || a.email).localeCompare(b.name || b.email)));
   }, onError);
 }
@@ -204,6 +217,20 @@ export function watchPeople(cb, onError) {
 export function watchEditable(user, cb, onError) {
   return onSnapshot(query(collection(db, "games"), where("editors", "array-contains", user.email)), (snap) => {
     cb(snap.docs.filter((d) => d.data().owner !== user.uid).map((d) => ({ docId: d.id, ...d.data() })));
+  }, onError);
+}
+
+/** Live list of one team's games (for a coach an admin has let edit that team). */
+export function watchTeamGames(teamUid, cb, onError) {
+  return onSnapshot(query(collection(db, "games"), where("owner", "==", teamUid)), (snap) => {
+    cb(snap.docs.map((d) => ({ docId: d.id, ...d.data() })));
+  }, onError);
+}
+
+/** Admins: every team, as [{ uid, teamName, ownerName }]. */
+export function watchAllTeams(cb, onError) {
+  return onSnapshot(collection(db, "users"), (snap) => {
+    cb(snap.docs.map((d) => ({ uid: d.id, teamName: String(d.data().teamName ?? ""), ownerName: String(d.data().ownerName ?? "") })));
   }, onError);
 }
 

@@ -6,6 +6,7 @@ rules_version = '2';
 //   admin  – a coach who can also add/remove coaches and admins
 //   coach  – (or no role, for older entries) uses the app fully
 //   player – can only view the games and stats of the team (coach) that added them
+//   edits  – (coaches) uids of teams whose games they can edit live; set by admins
 // Admins manage coaches and admins; any coach can add/remove their own players.
 //
 // Your squad lives in /users/{uid}; only you can change it. If you share your
@@ -14,6 +15,7 @@ rules_version = '2';
 // Each game is /games/{uid}_{id}. Its creator controls it. If marked shared,
 // every coach can view it. Coaches listed in its `editors` can edit the game
 // itself (events, clock, subs), but not who can edit, sharing, or delete.
+// Coaches an admin has given a team (allow.edits) can do the same in all its games.
 // The creator's players can view all of the creator's games.
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -61,12 +63,14 @@ service cloud.firestore {
     }
 
     function isEditor(data) {
-      return email() in data.get('editors', []);
+      return email() in data.get('editors', [])
+        || data.owner in me().get('edits', []);
     }
 
     // A well-formed allowlist entry.
     function validEntry(data) {
-      return data.keys().hasOnly(['name', 'role', 'team', 'addedBy'])
+      return data.keys().hasOnly(['name', 'role', 'team', 'addedBy', 'edits'])
+        && (!('edits' in data) || data.edits is list && data.edits.size() <= 30 && data.get('role', 'coach') != 'player')
         && data.get('name', '') is string && data.get('name', '').size() <= 60
         && data.get('role', 'coach') in ['coach', 'admin', 'player']
         && (data.get('role', 'coach') != 'player' || data.get('team', '') is string && data.get('team', '').size() > 0);
@@ -94,7 +98,8 @@ service cloud.firestore {
     }
 
     match /users/{uid} {
-      allow read: if (isCoach() && (request.auth.uid == uid || resource.data.shared == true))
+      allow read: if (isCoach() && (request.auth.uid == uid || resource.data.shared == true
+          || isAdmin() || uid in me().get('edits', [])))
         || isPlayerOf(uid);
       allow write: if isCoach() && request.auth.uid == uid;
     }

@@ -238,3 +238,31 @@ test("a player listed as a game editor still can't edit", async () => {
     setDoc(doc(ctx.firestore(), "games/me_30"), { owner: "me", shared: false, editors: ["kid@example.com"], game: { id: 30 } }));
   await assertFails(updateDoc(doc(as(PLAYER), "games/me_30"), { "game.events": arrayUnion({ id: 1 }) }));
 });
+
+test("admins give a coach live editing of a whole team; only admins can", async () => {
+  await seedRoles();
+  await env.withSecurityRulesDisabled((ctx) => setDoc(doc(ctx.firestore(), "games/me_40"), { owner: "me", shared: false, editors: [], game: { id: 40 } }));
+  const bro = as(BRO);
+  // Not yet: brother can't see or edit my unshared game, or grant himself access.
+  await assertFails(getDoc(doc(bro, "games/me_40")));
+  await assertFails(updateDoc(doc(bro, "allow/brother@example.com"), { edits: ["me"] }));
+  await assertFails(updateDoc(doc(as(ME), "allow/brother@example.com"), { edits: ["me"] }));
+  // The admin grants it.
+  await assertSucceeds(updateDoc(doc(as(ADMIN), "allow/brother@example.com"), { edits: ["me"] }));
+  const list = await assertSucceeds(getDocs(query(collection(bro, "games"), where("owner", "==", "me"))));
+  if (list.size !== 3) throw new Error(`expected 3 team games, got ${list.size}`);
+  await assertSucceeds(getDoc(doc(bro, "users/me")));
+  await assertSucceeds(updateDoc(doc(bro, "games/me_40"), { "game.events": arrayUnion({ id: 1 }) }));
+  // Still not the owner: no sharing, editors or deleting; other teams untouched.
+  await assertFails(updateDoc(doc(bro, "games/me_40"), { shared: true }));
+  await assertFails(updateDoc(doc(bro, "games/me_40"), { editors: ["x@example.com"] }));
+  await assertFails(deleteDoc(doc(bro, "games/me_40")));
+  await assertFails(getDocs(query(collection(bro, "games"), where("owner", "==", "boss"))));
+  // Players can't be given it; only admins list every team.
+  await assertFails(updateDoc(doc(as(ADMIN), "allow/kid@example.com"), { edits: ["me"] }));
+  await assertSucceeds(getDocs(collection(as(ADMIN), "users")));
+  await assertFails(getDocs(collection(bro, "users")));
+  // Taking it away again.
+  await assertSucceeds(updateDoc(doc(as(ADMIN), "allow/brother@example.com"), { edits: [] }));
+  await assertFails(getDoc(doc(bro, "games/me_40")));
+});

@@ -624,7 +624,9 @@ test.describe("signing out and sharing a team", () => {
     const href = await sis.locator("#shared-teams li", { hasText: "2 players · 1 game" }).locator("a").first().getAttribute("href");
     const mine = sis.locator(`#shared-teams li:has(a[href="${href}"])`);
     await expect(mine).toHaveCount(1);
+    await expect(mine.locator(".primary")).toHaveText("Our Team"); // the team's name, not the coach's
     await mine.locator("a").click();
+    await expect(sis.locator("h1")).toHaveText("Our Team");
     await expect(sis.locator("#team-squad li")).toHaveText([/4\s*Chris/, /9\s*Jordan/]);
     await expect(sis.locator("#team-games li")).toContainText(opponent);
     await expect(sis.locator("tbody")).toContainText("#9 Jordan");
@@ -637,6 +639,15 @@ test.describe("signing out and sharing a team", () => {
     await newGame(page, later);
     await sis.goto(new URL("./#/games", page.url()).href);
     await expect(mine).toContainText("2 games");
+
+    // Renaming the team shows on the other coach's phone, on the team and its games.
+    await page.goto("./#/squad");
+    await page.locator("#team-name").fill("Renamed FC");
+    await page.locator("#save-team-name").click();
+    await expect(mine.locator(".primary")).toHaveText("Renamed FC");
+    await mine.locator("a").click();
+    await expect(sis.locator("#team-games li", { hasText: opponent })).toContainText(`Renamed FC vs ${opponent}`);
+    await sis.goto(new URL("./#/games", page.url()).href);
 
     // Unsharing the team hides it all again.
     await page.goto("./#/squad");
@@ -887,10 +898,17 @@ test.describe("admins, coaches and players", () => {
     const coach = freshEmail("newcoach");
     await page.locator("#admin-email").fill(coach.toUpperCase()); // stored lowercase
     await page.locator("#admin-name").fill("New Coach");
+    // Someone else changing the list meanwhile doesn't wipe what's typed.
+    const meanwhile = freshEmail("meanwhile");
+    await allow(meanwhile);
+    await expect(page.locator(`li[data-email="${meanwhile}"]`)).toHaveCount(1);
+    await expect(page.locator("#admin-name")).toHaveValue("New Coach");
+    await expect(page.locator("#admin-name")).toBeFocused();
     await page.locator("#admin-add").click();
     const row = page.locator(`#coach-list li[data-email="${coach}"]`);
     await expect(row).toContainText("New Coach");
     await expect(page.locator("#toast")).toContainText("Added"); // confirmed by the server
+    await expect(page.locator("#admin-email")).toHaveValue(""); // ready for the next one
 
     // The new coach can sign in, and has no Admin tab.
     const { ctx, page: other } = await phone(browser, page, coach);
@@ -901,11 +919,71 @@ test.describe("admins, coaches and players", () => {
     await row.getByRole("button", { name: /Make admin/ }).click();
     await expect(page.locator(`#admins li[data-email="${coach}"]`)).toHaveCount(1);
     // You can't remove or demote yourself.
-    await expect(page.locator(`#admins li[data-email="${admin}"] button`)).toHaveCount(0);
+    await expect(page.locator(`#admins li[data-email="${admin}"]`).getByRole("button", { name: /Remove|Make/ })).toHaveCount(0);
 
     await page.locator(`#admins li[data-email="${coach}"]`).getByRole("button", { name: `Remove ${coach}`, exact: true }).click();
     await page.locator("#dialog-ok").click();
     await expect(page.locator(`li[data-email="${coach}"]`)).toHaveCount(0);
+    await ctx.close();
+  });
+
+  test("an admin gives a coach live editing of a team; every tap syncs between phones quickly", async ({ page, browser }) => {
+    test.setTimeout(90_000);
+    const admin = freshEmail("admin");
+    const helper = freshEmail("helper");
+    await allow(admin, { role: "admin", name: "Boss" });
+    await allow(helper, { name: "Helper" });
+    await page.goto("./");
+    await signInAs(page, admin);
+    await addSquad(page, "4 Chris\n9 Jordan");
+    const opponent = `Live FC ${Date.now()}`;
+    await newGame(page, opponent);
+    const { ctx, page: coach } = await phone(browser, page, helper);
+    const row = coach.locator("#co-list li", { hasText: opponent });
+    await expect(row).toHaveCount(0);
+
+    // The admin ticks their team under Live editing for the helper.
+    const gameUrl = page.url();
+    await page.goto("./#/admin");
+    await page.getByRole("button", { name: `Live editing for ${helper}` }).click();
+    await page.locator("#edit-teams label", { hasText: admin }).locator("input").check();
+    await page.locator("#dialog-ok").click();
+    await expect(page.locator(`li[data-email="${helper}"] .edits-line`)).toHaveText("Edits live: Our Team");
+
+    // The helper gets the game straight away (no reload), titled with the team's name.
+    await expect(row).toHaveCount(1);
+    await expect(row.locator(".primary")).toHaveText(`Our Team vs ${opponent}`);
+    await row.locator("a").click();
+    await page.goto(gameUrl);
+    await expect(coach.locator(".live-title")).toContainText(`Our Team vs ${opponent}`);
+
+    // Every tap shows on the other phone within a couple of seconds.
+    const quick = { timeout: 5000 }; // typically well under a second; slack for a busy test emulator
+    await coach.locator("#phase-btn").click();
+    await coach.locator("#dialog-ok").click(); // kick off
+    await expect(page.locator("#phase-label")).toHaveText("1st half", quick);
+    await page.locator("#poss-us").click();
+    await expect(coach.locator("#poss-us")).toHaveAttribute("aria-pressed", "true", quick);
+    await coach.locator("#poss-them").click();
+    await expect(page.locator("#poss-them")).toHaveAttribute("aria-pressed", "true", quick);
+    await expect(page.locator("#poss-us")).toHaveAttribute("aria-pressed", "false", quick);
+    await coach.locator('[data-event="goal"]').click();
+    await coach.locator('.pl-btn[data-number="9"]').click();
+    await tapPitch(coach, 0.95, 0.5);
+    await expect(page.locator("#score")).toHaveText("1–0", quick);
+
+    // A game the team plays later is editable too.
+    const later = `Later FC ${Date.now()}`;
+    await newGame(page, later);
+    await coach.goto(new URL("./#/games", page.url()).href);
+    await expect(coach.locator("#co-list li", { hasText: later })).toHaveCount(1);
+
+    // Taking it away removes the team's games from the helper.
+    await page.goto(new URL("./#/admin", page.url()).href);
+    await page.getByRole("button", { name: `Live editing for ${helper}` }).click();
+    await page.locator("#edit-teams label", { hasText: admin }).locator("input").uncheck();
+    await page.locator("#dialog-ok").click();
+    await expect(coach.locator("#co-list li", { hasText: later })).toHaveCount(0);
     await ctx.close();
   });
 

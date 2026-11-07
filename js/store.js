@@ -61,7 +61,8 @@ export function teamNameError(name) {
 }
 
 /** "Ballyhale U12 vs Rovers": your team's name as recorded on the game, else your current one. */
-export const matchTitle = (game, teamName) => `${game.team || teamName || "Us"} vs ${game.opponent}`;
+/** "Team vs Opponent": the team's current name when known, else the one saved on the game. */
+export const matchTitle = (game, teamName) => `${teamName || game.team || "Us"} vs ${game.opponent}`;
 
 export function emptyState() {
   return { nextId: 1, players: [], games: [] };

@@ -29,6 +29,8 @@ const app = {
   coaches: [], // the coaches and admins among them
   role: null, // "admin" | "coach" | "player"
   playerTeam: null, // for a player: the uid of the coach whose team they follow
+  edits: [], // for a coach: uids of teams an admin has let them edit live
+  allTeams: [], // for an admin: every team, [{ uid, teamName, ownerName }]
   route: { name: "games" },
   pending: null, // live entry: { gameId, x, y, type, playerId } – playerId undefined = not chosen, null = unknown
   statsFilter: { half: 0, types: new Set(S.EVENT_IDS), playerId: undefined },
@@ -52,6 +54,8 @@ function commit(mutate, { rerender = true } = {}) {
 //   co:      docId → game copy, for other coaches' games you can edit
 const sent = { players: null, games: new Map(), co: new Map() };
 let stopWatching = [];
+// Feeds of games for the teams an admin has let this coach edit: uid → stop().
+let teamFeeds = new Map();
 
 const clone = (v) => JSON.parse(JSON.stringify(v));
 
@@ -139,6 +143,8 @@ async function accessLost(e) {
     app.access = "denied";
     stopWatching.forEach((stop) => stop());
     stopWatching = [];
+    teamFeeds.forEach((stop) => stop());
+    teamFeeds = new Map();
     render();
   }
 }
@@ -280,7 +286,7 @@ function receive(user, games, fromServer) {
   incoming.nextId = Math.max(incoming.nextId, app.state.nextId);
   app.state = incoming;
   storage.saveState(app.state);
-  render();
+  refresh();
 }
 
 /** Other coaches' games you can edit, as [{ docId, owner, ownerName, st, game }]. */
@@ -311,7 +317,7 @@ function receiveEditable(list) {
   for (const docId of [...sent.co.keys()]) if (!next.some((x) => x.docId === docId)) sent.co.delete(docId);
   const changed = stable(next.map((x) => x.game)) !== stable(app.coGames.map((x) => x.game));
   app.coGames = next;
-  if (changed || ["games", "co", "costats"].includes(app.route.name)) render();
+  if (changed || ["games", "co", "costats"].includes(app.route.name)) refresh();
 }
 
 /** Squad and games in a fixed shape and order, for comparing two copies. */
@@ -337,6 +343,8 @@ async function startAccount(user) {
   delete document.body.dataset.sync; // set to "ready" once this account's first sync is done
   stopWatching.forEach((stop) => stop());
   stopWatching = [];
+  teamFeeds.forEach((stop) => stop());
+  teamFeeds = new Map();
   reconciled = false;
   inFlight = 0;
   heldBack = null;
@@ -351,6 +359,8 @@ async function startAccount(user) {
   app.coaches = [];
   app.role = null;
   app.playerTeam = null;
+  app.edits = [];
+  app.allTeams = [];
   app.user = user;
   app.authError = null;
   if (!user) {
@@ -378,6 +388,7 @@ async function startAccount(user) {
   }
   app.role = access.role;
   app.playerTeam = access.team ?? null;
+  app.edits = access.edits ?? [];
   app.meta.roles = { ...app.meta.roles, [user.uid]: access };
   app.meta.allowed = { ...app.meta.allowed, [user.uid]: true };
   app.meta.lastUser = user;
@@ -389,18 +400,31 @@ async function startAccount(user) {
     document.body.dataset.sync = "ready";
     return;
   }
+  // Changes to this account's access apply straight away: removed → locked out;
+  // a new role → start over with it; new team edit rights → follow those teams.
+  stopWatching.push(cloud.watchAccess(user, (now) => {
+    if (app.user !== user || app.access !== "allowed") return;
+    if (now === false) return accessLost({ code: "permission-denied" });
+    if (now.role !== app.role || now.team !== app.playerTeam) return startAccount(user);
+    app.meta.roles = { ...app.meta.roles, [user.uid]: now };
+    saveMeta();
+    if (stable(now.edits) !== stable(app.edits)) {
+      app.edits = now.edits;
+      followTeams();
+    }
+  }, (e) => console.warn("Access feed unavailable:", e)));
   if (app.role === "player") {
     // Players only follow their team, read only.
     stopWatching.push(cloud.watchTeam(app.playerTeam, (team, games) => {
       app.sharedTeams = team ? [{ uid: app.playerTeam, ...team }] : [];
       app.shared = games;
       document.body.dataset.sync = "ready";
-      render();
+      refresh();
     }, (e) => { console.warn("Team unavailable:", e); accessLost(e); }));
     return;
   }
   const warn = (what) => (e) => { console.warn(`${what} unavailable:`, e); accessLost(e); };
-  const rerenderOn = (...routes) => () => { if (routes.includes(app.route.name)) render(); };
+  const rerenderOn = (...routes) => () => { if (routes.includes(app.route.name)) refresh(); };
   const sharedChanged = rerenderOn("games", "shared", "team");
   const teamsChanged = rerenderOn("games", "team");
   const peopleChanged = rerenderOn("data", "stats", "admin");
@@ -408,13 +432,49 @@ async function startAccount(user) {
     cloud.watchMine(user.uid, receive, syncFailed),
     cloud.watchShared(user.uid, (list) => { app.shared = list; sharedChanged(); }, warn("Shared games")),
     cloud.watchSharedTeams(user.uid, (list) => { app.sharedTeams = list; teamsChanged(); }, warn("Shared teams")),
-    cloud.watchEditable(user, receiveEditable, warn("Games you can edit")),
+    cloud.watchEditable(user, (list) => { editableDirect = list; mergeEditable(); }, warn("Games you can edit")),
     cloud.watchPeople((list) => {
       app.people = list;
       app.coaches = list.filter((p) => p.role !== "player");
       peopleChanged();
     }, warn("Coaches list")),
   );
+  editableDirect = [];
+  editableByTeam = new Map();
+  followTeams();
+  if (app.role === "admin") {
+    stopWatching.push(cloud.watchAllTeams((list) => { app.allTeams = list; if (app.route.name === "admin") refresh(); }, warn("Teams")));
+  }
+}
+
+// Games you can edit come from two places: games that list you as an editor, and
+// every game of the teams an admin has let you edit.
+let editableDirect = [];
+let editableByTeam = new Map();
+function mergeEditable() {
+  const byId = new Map();
+  for (const x of [...editableDirect, ...[...editableByTeam.values()].flat()]) {
+    if (x.owner !== app.user?.uid) byId.set(x.docId, x);
+  }
+  receiveEditable([...byId.values()]);
+}
+
+/** Starts (and stops) the feeds for the teams in app.edits. */
+function followTeams() {
+  const user = app.user;
+  const want = new Set(app.edits.filter((uid) => uid !== user.uid));
+  for (const [uid, stop] of teamFeeds) {
+    if (!want.has(uid)) { stop(); teamFeeds.delete(uid); editableByTeam.delete(uid); }
+  }
+  for (const uid of want) {
+    if (teamFeeds.has(uid)) continue;
+    teamFeeds.set(uid, cloud.watchTeamGames(uid, (list) => {
+      if (app.user !== user || !teamFeeds.has(uid)) return;
+      editableByTeam.set(uid, list);
+      mergeEditable();
+    }, (e) => console.warn("Team games unavailable:", e)));
+  }
+  mergeEditable();
 }
 
 const saveMeta = () => storage.saveMeta(app.meta);
@@ -661,6 +721,36 @@ function render() {
   tick();
 }
 
+// Typing survives redraws caused by other people's changes (refresh), and only those:
+// the app's own redraws (after saving, say) start fields afresh.
+view.addEventListener("input", (e) => { if (e.target.id) e.target.dataset.typed = "1"; });
+
+/** Redraws for a change from elsewhere, keeping what's being typed and where. */
+function refresh() {
+  const typed = [...view.querySelectorAll("[data-typed][id]")].map((el) => ({
+    id: el.id, value: el.value, focused: document.activeElement === el, hash: location.hash,
+    sel: (() => { try { return [el.selectionStart, el.selectionEnd]; } catch { return null; } })(),
+  }));
+  render();
+  for (const t of typed) {
+    const el = document.getElementById(t.id);
+    if (!el || t.hash !== location.hash) continue;
+    el.value = t.value;
+    el.dataset.typed = "1";
+    if (t.focused) {
+      el.focus();
+      try { if (t.sel) el.setSelectionRange(...t.sel); } catch { /* not a text field */ }
+    }
+  }
+}
+
+function clearInputs(...ids) {
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (el) { el.value = ""; delete el.dataset.typed; }
+  }
+}
+
 function renderBanner(live) {
   const banner = document.getElementById("banner");
   const m = app.meta;
@@ -734,10 +824,11 @@ function viewHelp() {
     section("6. Share with other coaches", false, ul(
       [b("One game, view only"), ": on its stats page, tick ", b("Share with coaches"), "."],
       [b("Your whole team, view only"), ": on ", b("Squad"), ", tick ", b("Share my team with coaches"), ". Covers every game, now and later."],
-      [b("Let a coach edit a game"), ": on its stats page, under ", b("Coaches who can edit this game"), ", tick their name. You can both log at the same time."],
+      [b("Let a coach edit a game"), ": on its stats page, under ", b("Coaches who can edit this game"), ", tick their name. You can both log at the same time, and every tap (events, clock, possession, subs) shows on both phones within a second or two."],
+      [b("Let a coach edit all your games"), ": ask an admin. On the ", b("Admin"), " tab they tap ", b("Live editing"), " next to the coach and tick your team."],
       ["Only you can share, choose editors, change the team sheet or delete your games."])),
     section("7. Coaches, admins and players", false, ul(
-      [b("Coaches"), " use the app fully. ", b("Admins"), " are coaches who also add and remove coaches on the ", b("Admin"), " tab."],
+      [b("Coaches"), " use the app fully. ", b("Admins"), " are coaches who also add and remove coaches, and choose who can edit which team's games live, on the ", b("Admin"), " tab."],
       [b("Players"), " can view your games and stats, live, and nothing else. Add their Google (Gmail) address under ", b("Account → Player logins"), "."],
       ["Everything saves to your account after every tap. No signal? Keep going: it uploads when you're back online."],
       [b("Account → Export JSON"), " downloads a spare copy of everything."])),
@@ -865,7 +956,7 @@ function viewTeam(uid = app.route.uid) {
           const sc = S.score(x.game);
           return h("li", {},
             h("a", { class: "main", href: `#/shared/${encodeURIComponent(x.docId)}` },
-              h("div", { class: "primary" }, S.matchTitle(x.game, x.ownerName)),
+              h("div", { class: "primary" }, S.matchTitle(x.game, team.teamName)),
               h("div", { class: "secondary" }, fmtDate(x.game.date))),
             h("span", { class: "badge" }, `${sc.us}–${sc.them} · ${PHASE_LABEL[S.phase(x.game)]}`));
         }))
@@ -890,8 +981,8 @@ function viewPlayerHome() {
 
 // ---- Games list
 
-/** A shared team's name, for titles: their team name, else the coach's name. */
-const teamNameOf = (uid, fallback) => app.sharedTeams.find((t) => t.uid === uid)?.teamName || fallback || "Them";
+/** Another coach's current team name, when we can see their team (else titles use the name saved on the game). */
+const teamNameOf = (uid) => app.sharedTeams.find((t) => t.uid === uid)?.teamName || app.allTeams.find((t) => t.uid === uid)?.teamName || "";
 
 /** Shared games that aren't already shown under a shared team. */
 const sharedGamesOnly = () => {
@@ -926,13 +1017,13 @@ function viewGames() {
       : h("p", { class: "muted", style: "margin-top:16px" }, "No games yet."),
     app.coGames.length > 0 && [
       h("h2", {}, "Games you can edit"),
-      h("p", { class: "muted small" }, "Other coaches' games you've been added to. Log events with them as it happens."),
+      h("p", { class: "muted small" }, "Other coaches' games you can log in: games you've been added to, and every game of teams an admin has given you."),
       h("ul", { class: "list", id: "co-list" }, [...app.coGames].sort((a, b) => (a.game.date < b.game.date ? 1 : -1)).map((x) => {
         const c = S.clock(x.game);
         const sc = S.score(x.game);
         return h("li", {},
           h("a", { class: "main", href: `#/co/${encodeURIComponent(x.docId)}` },
-            h("div", { class: "primary" }, S.matchTitle(x.game, teamNameOf(x.owner, x.ownerName))),
+            h("div", { class: "primary" }, S.matchTitle(x.game, teamNameOf(x.owner))),
             h("div", { class: "secondary" }, `${fmtDate(x.game.date)} · ${x.ownerName || "another coach"}'s game`)),
           h("span", { class: `badge${c.running ? " live" : ""}` }, `${sc.us}–${sc.them} · ${c.running ? `${PHASE_LABEL[c.phase]} ${S.formatClock(c.seconds)}` : PHASE_LABEL[c.phase]}`));
       }))],
@@ -942,8 +1033,8 @@ function viewGames() {
         const n = app.shared.filter((x) => x.owner === t.uid).length;
         return h("li", {},
           h("a", { class: "main", href: `#/team/${encodeURIComponent(t.uid)}` },
-            h("div", { class: "primary" }, `${t.ownerName || "A coach"}'s team`),
-            h("div", { class: "secondary" }, `${plural((t.players ?? []).filter((p) => !p.removed).length, "player")} · ${plural(n, "game")} · view only`)));
+            h("div", { class: "primary" }, t.teamName || `${t.ownerName || "A coach"}'s team`),
+            h("div", { class: "secondary" }, `${t.teamName && t.ownerName ? `${t.ownerName} · ` : ""}${plural((t.players ?? []).filter((p) => !p.removed).length, "player")} · ${plural(n, "game")} · view only`)));
       }))],
     sharedGamesOnly().length > 0 && [
       h("h2", {}, "Games shared with me"),
@@ -952,7 +1043,7 @@ function viewGames() {
         const sc = S.score(x.game);
         return h("li", {},
           h("a", { class: "main", href: `#/shared/${encodeURIComponent(x.docId)}` },
-            h("div", { class: "primary" }, S.matchTitle(x.game, teamNameOf(x.owner, x.ownerName))),
+            h("div", { class: "primary" }, S.matchTitle(x.game, teamNameOf(x.owner))),
             h("div", { class: "secondary" }, `${fmtDate(x.game.date)} · by ${x.ownerName || "another coach"}`)),
           h("span", { class: "badge" }, `${sc.us}–${sc.them} · ${PHASE_LABEL[S.phase(x.game)]}`));
       }))],
@@ -1016,7 +1107,11 @@ function teamNameForm({ onSaved, compact = false } = {}) {
   const save = () => {
     const msg = S.teamNameError(input.value);
     if (msg) { err.textContent = msg; err.hidden = false; input.focus(); return false; }
-    commit((st) => { st.teamName = input.value.trim(); }, { rerender: !onSaved });
+    // Rename every game too, so other coaches see the new name on all of them.
+    commit((st) => {
+      st.teamName = input.value.trim();
+      for (const g of st.games) g.team = st.teamName;
+    }, { rerender: !onSaved });
     onSaved?.();
     return true;
   };
@@ -1076,7 +1171,7 @@ function viewLive(game) {
     h("div", { class: "live-title" },
       h("a", { class: "back", href: "#/games", "aria-label": "Back to games" }, "‹"),
       h("span", { class: "opp", title: titleOf(game) },
-        h("span", { class: "us-name" }, game.team || ctxFor(game).st.teamName || "Us"), h("span", { class: "vs-name" }, ` vs ${game.opponent}`))),
+        h("span", { class: "us-name" }, ctxFor(game).st.teamName || game.team || "Us"), h("span", { class: "vs-name" }, ` vs ${game.opponent}`))),
     h("div", { class: "live-head" },
       h("span", { class: "score", id: "score", "aria-label": `Score: us ${S.score(game).us}, them ${S.score(game).them}` }, `${S.score(game).us}–${S.score(game).them}`),
       h("div", { class: "title" },
@@ -1574,7 +1669,8 @@ function possessionSummary(game, half) {
 /** The creator picks which coaches can edit this game alongside them. */
 function editorsPicker(game) {
   const me = app.user?.email;
-  const others = app.coaches.filter((c) => c.email !== me);
+  const teamEditors = app.coaches.filter((c) => c.email !== me && c.edits?.includes(app.user?.uid));
+  const others = app.coaches.filter((c) => c.email !== me && !teamEditors.includes(c));
   const editors = new Set(game.editors ?? []);
   return h("div", { class: "card editors", id: "editors" },
     h("strong", {}, "Coaches who can edit this game"),
@@ -1591,7 +1687,9 @@ function editorsPicker(game) {
             }),
           }),
           h("span", {}, c.name ? `${c.name} ` : "", h("span", { class: "muted small" }, c.email))))
-      : h("p", { class: "muted small", style: "margin:0" }, "No other coaches on the list yet. Add them in the Firebase console (see Account)."));
+      : h("p", { class: "muted small", style: "margin:0" }, "No other coaches on the list yet. An admin adds them on the Admin tab."),
+    teamEditors.length > 0 && h("p", { class: "muted small", id: "team-editors", style: "margin:8px 0 0" },
+      "Also editing all your games (set by an admin): ", teamEditors.map((c) => c.name || c.email).join(", "), "."));
 }
 
 /** With a game, players are labelled and sorted by the number they wore in it. */
@@ -1801,6 +1899,7 @@ function myPlayersSection() {
     try {
       await cloud.addPerson(e, { name: name.value, role: "player", team: app.user.uid }, app.user.email);
       toast(`${name.value.trim() || e} can now view your team.`);
+      clearInputs("player-email", "player-name");
     } catch (x) {
       err.textContent = `Couldn't add them: ${x.message}`;
       err.hidden = false;
@@ -1839,6 +1938,7 @@ function viewAdmin() {
     try {
       await cloud.addPerson(e, { name: name.value, role: role.value }, app.user.email);
       toast(`Added ${name.value.trim() || e}.`);
+      clearInputs("admin-email", "admin-name");
     } catch (x) {
       err.textContent = `Couldn't add: ${x.message}`;
       err.hidden = false;
@@ -1848,12 +1948,21 @@ function viewAdmin() {
     const team = app.sharedTeams.find((t) => t.uid === uid);
     return team?.teamName || team?.ownerName || (uid === app.user.uid ? (app.state.teamName || "you") : "a coach");
   };
+  const teamLabel = (uid) => {
+    const t = app.allTeams.find((x) => x.uid === uid);
+    return t ? (t.teamName || `${t.ownerName || "A coach"}'s team`) : null;
+  };
   const row = (p) => {
     const me = p.email === app.user.email;
+    const edits = p.role === "player" ? [] : p.edits.map(teamLabel).filter(Boolean);
     return h("li", { "data-email": p.email },
       h("div", { class: "main" },
         h("div", { class: "primary" }, p.name || p.email, me ? " (you)" : ""),
-        h("div", { class: "secondary" }, [p.name && p.email, p.role === "player" && `player · ${coachName(p.team)}`].filter(Boolean).join(" · "))),
+        h("div", { class: "secondary" }, [p.name && p.email, p.role === "player" && `player · ${coachName(p.team)}`].filter(Boolean).join(" · ")),
+        edits.length > 0 && h("div", { class: "secondary edits-line" }, `Edits live: ${edits.join(", ")}`)),
+      p.role !== "player" && h("button", {
+        type: "button", class: "link-btn", "aria-label": `Live editing for ${p.email}`, onclick: () => liveEditingDialog(p),
+      }, "Live editing"),
       p.role !== "player" && !me && h("button", {
         type: "button", class: "link-btn", "aria-label": `${p.role === "admin" ? "Remove admin from" : "Make admin"} ${p.email}`,
         onclick: () => cloud.setRole(p.email, p.role === "admin" ? "coach" : "admin").catch((x) => toast(`Couldn't change: ${x.message}`)),
@@ -1866,7 +1975,7 @@ function viewAdmin() {
   const group = (title, id, list) => [h("h2", {}, `${title} (${list.length})`), list.length ? h("ul", { class: "list", id }, list.map(row)) : h("p", { class: "muted small" }, "None.")];
   return h("section", { id: "admin" },
     h("h1", {}, "Admin"),
-    h("p", { class: "muted" }, "Add coaches and admins here. Coaches add their own player logins on the Account tab."),
+    h("p", { class: "muted" }, "Add coaches and admins here. ", h("strong", {}, "Live editing"), " lets a coach log events, run the clock and make subs in every game of the teams you pick, as they happen. Coaches add their own player logins on the Account tab."),
     h("div", { class: "card" },
       h("label", { for: "admin-email" }, "Add a coach"),
       h("div", { class: "field" }, email),
@@ -1876,6 +1985,31 @@ function viewAdmin() {
     group("Admins", "admins", app.people.filter((p) => p.role === "admin")),
     group("Coaches", "coach-list", app.people.filter((p) => p.role === "coach")),
     group("Players", "players", app.people.filter((p) => p.role === "player")));
+}
+
+/** Admins: pick the teams whose games a coach can edit live. */
+function liveEditingDialog(p) {
+  const teams = [...app.allTeams].sort((a, b) => (a.teamName || a.ownerName).localeCompare(b.teamName || b.ownerName));
+  const has = new Set(p.edits);
+  openDialog({
+    title: `Live editing for ${p.name || p.email}`,
+    body: [
+      h("p", { class: "muted small" }, "They can log events, run the clock, change possession and make subs in every game of these teams, at the same time as the team's coach. Only the team's coach can share, change the team sheet or delete games."),
+      teams.length
+        ? h("div", { id: "edit-teams" }, teams.map((t) => h("label", { class: "editor-row" },
+            h("input", { type: "checkbox", checked: has.has(t.uid), "data-uid": t.uid }),
+            h("span", {}, t.teamName || "(no team name yet)", " ", h("span", { class: "muted small" }, t.ownerName)))))
+        : h("p", { class: "muted small" }, "No teams yet. A team appears here once its coach has added a squad."),
+    ],
+    okLabel: "Save",
+    onOk: () => {
+      const picked = [...document.querySelectorAll("#edit-teams input:checked")].map((x) => x.dataset.uid);
+      // Keep any teams not listed here (e.g. not loaded yet), unless they were unticked.
+      const listed = new Set(teams.map((t) => t.uid));
+      const uids = [...new Set([...p.edits.filter((u) => !listed.has(u)), ...picked])].sort();
+      cloud.setEdits(p.email, uids).then(() => toast(`Saved live editing for ${p.name || p.email}.`), (x) => toast(`Couldn't save: ${x.message}`));
+    },
+  });
 }
 
 // ---------------------------------------------------------------- clock & screen
